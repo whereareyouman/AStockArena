@@ -45,6 +45,7 @@ from tools.price_tools import (
     upsert_position_record,
     get_price_limits,
 )
+from tools.news_deduplicator import deduplicate_news_by_embedding
 from prompts.agent_prompt import get_agent_system_prompt, STOP_SIGNAL
 
 # 并发安全：用于保护 news.csv 写入
@@ -1267,6 +1268,19 @@ class BaseAgent:
                         })
                     
                     realtime_results = self._filter_allowed_news_records(realtime_results)
+                    
+                    # 对实时新闻进行嵌入去重（针对标题，相似度阈值0.85）
+                    if realtime_results:
+                        print(f"🔍 对 {len(realtime_results)} 条实时新闻进行嵌入去重...")
+                        try:
+                            realtime_results = deduplicate_news_by_embedding(
+                                realtime_results,
+                                similarity_threshold=0.85,
+                                field_to_compare='title'
+                            )
+                        except Exception as e:
+                            print(f"⚠️ 嵌入去重失败: {e}，跳过去重步骤")
+                    
                     print(f"✅ 成功获取 {len(realtime_results)} 条实时新闻（股票：{normalized_symbol or symbol_for_query}）")
                     
                     # 3. 保存实时新闻到 data/news.csv（追加模式，去重）——并发安全写入
@@ -1312,6 +1326,29 @@ class BaseAgent:
                                     combined = pd.concat([old, df_new], axis=0, ignore_index=True)
                                     combined = self._sanitize_news_dataframe(combined)
                                     combined = combined.drop_duplicates(subset=dedupe_subset, keep='last')
+                                    
+                                    # 对合并后的数据按 symbol 分组进行嵌入去重（针对科创板新闻）
+                                    try:
+                                        if 'symbol' in combined.columns and 'title' in combined.columns:
+                                            # 按 symbol 分组去重
+                                            deduplicated_groups = []
+                                            for symbol_code, group in combined.groupby('symbol'):
+                                                if symbol_code and str(symbol_code).startswith('SH688'):
+                                                    print(f"🔍 对股票 {symbol_code} 的 {len(group)} 条新闻进行嵌入去重...")
+                                                    group_list = group.to_dict('records')
+                                                    deduplicated_list = deduplicate_news_by_embedding(
+                                                        group_list,
+                                                        similarity_threshold=0.85,
+                                                        field_to_compare='title'
+                                                    )
+                                                    deduplicated_groups.extend(deduplicated_list)
+                                                else:
+                                                    # 非科创板新闻不去重
+                                                    deduplicated_groups.extend(group.to_dict('records'))
+                                            combined = pd.DataFrame(deduplicated_groups)
+                                    except Exception as e:
+                                        print(f"⚠️ 合并后的嵌入去重失败: {e}，跳过去重步骤")
+                                    
                                     combined.to_csv(csv_path, index=False, encoding='utf-8-sig')
                                     print(f"💾 已将新闻追加到 {csv_path}（去重后）")
                                 else:
