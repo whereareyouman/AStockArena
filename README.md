@@ -1,4 +1,4 @@
-# AI-Trader 使用手册
+# AStockArena 使用手册
 
 > 说明整体环境、运行流程、共享预抓、备份以及 LLM API 现状，便于快速上手多模型 A 股日内交易 Agent。
 
