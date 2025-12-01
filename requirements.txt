@@ -1,0 +1,34 @@
+# AI-Trader Dependencies
+# Suggest python 3.12+
+
+langchain>=0.2.0,<1.0.0
+langchain-core>=0.2.0,<1.0.0
+langchain-openai>=0.1.0,<1.0.0
+langchain-google-genai>=1.0.0
+langgraph>=0.0.50,<1.0.0
+
+google-generativeai>=0.6.0
+langgraph>=0.0.50,<1.0.0
+pandas
+numpy
+python-dotenv>=1.0.0
+akshare>=1.12.0
+requests>=2.31.0
+tspytsl
+pandas-ta
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+
+pandas>=2.0.0
+numpy>=1.24.0
+pandas-ta>=0.3.14b0
+
+akshare>=1.12.0
+tspytsl
+
+
+python-dotenv>=1.0.0
+requests>=2.31.0
+tenacity>=8.0.0
+

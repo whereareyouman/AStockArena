@@ -1,0 +1,72 @@
+{
+  "agent_type": "BaseAgent",
+  "date_range": {
+    "init_date": "2025-11-28",
+    "end_date": "2025-11-28"
+  },
+  "models": [
+    {
+      "name": "claude-haiku-4-5",
+      "basemodel": "claude-haiku-4-5",
+      "signature": "claude-haiku-4-5",
+      "enabled": true,
+      "openai_base_url": "https://api.openai-proxy.org/v1"
+    },
+    {
+      "name": "deepseek-reasoner",
+      "basemodel": "deepseek-reasoner",
+      "signature": "deepseek-reasoner",
+      "enabled": true,
+      "openai_base_url": "https://api.openai-proxy.org/v1"
+    },
+    {
+      "name": "qwen3-235b",
+      "basemodel": "qwen3-235b-a22b",
+      "signature": "qwen3-235b",
+      "enabled": true,
+      "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    },
+    {
+      "name": "gemini-2.5-flash",
+      "basemodel": "gemini-2.5-flash",
+      "signature": "gemini-2.5-flash",
+      "enabled": true,
+      "safety_settings": {
+        "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+        "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+        "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE"
+      }
+    },
+    {
+      "name": "gpt-5.1",
+      "basemodel": "gpt-5.1",
+      "signature": "gpt-5.1",
+      "enabled": true,
+      "openai_base_url": "https://api.openai-proxy.org/v1"
+    }
+  ],
+  "agent_config": {
+    "max_steps": 30,
+    "max_retries": 3,
+    "base_delay": 1.5,
+    "initial_cash": 1000000.0,
+    "force_replay": false
+  },
+  "trading_rules": {
+    "commission_rate": 0.0003,
+    "min_commission": 5.0,
+    "stamp_duty_rate": 0.0005
+  },
+  "risk_management": {
+    "single_stock_max_position": 0.20
+  },
+  "data_config": {
+    "stock_json_path": "./data/ai_stock_data.json",
+    "news_csv_path": "./data/news.csv"
+  },
+  "log_config": {
+    "log_path": "./data/agent_data"
+  }
+}
+
