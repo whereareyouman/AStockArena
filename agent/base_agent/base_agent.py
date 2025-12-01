@@ -2592,6 +2592,16 @@ class BaseAgent:
                     )
                 except Exception:
                     pass
+            try:
+                from tools.backup_utils import run_backup_snapshot
+                reason = f"decision_{decision_count}_{today_date}_{current_time}"
+                ok = run_backup_snapshot(reason=reason)
+                if ok:
+                    print(f"✅ Backup completed for decision {decision_count}")
+                else:
+                    print(f"⚠️ Backup failed for decision {decision_count}")
+            except Exception as e:
+                print(f"⚠️ Error during backup: {e}")
             # 注意：不在这里关闭 TinySoft 客户端，以保持会话复用
             # 会话会在 run_date_range 结束时统一关闭，避免频繁登录
             pass
