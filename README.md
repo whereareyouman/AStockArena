@@ -194,12 +194,7 @@ AStockArena/
 │   ├── backup_utils.py        # Backup helpers
 │   └── json_file_manager.py   # JSON I/O
 │
-├── 📁 analysis/                # Experimental analysis and visualization
-│   ├── visualize.py           # Data visualization scripts
-│   └── visualizations/        # Generated visualizations & reports
-│       └── performance_summary.md  # Performance metrics summary
-│
-├── 📁 experiments/             # Alternative analysis workspace
+├── 📁 experiments/             # Experimental analysis and visualization
 │   ├── visualize.py           # Data visualization scripts
 │   └── visualizations/        # Generated visualizations & reports
 │       └── performance_summary.md  # Performance metrics summary
