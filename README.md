@@ -518,7 +518,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Undergraduates**: Sing Kwong LAI, Zihao FANG, Yiqing GE, Jitong ZHANG, Jinwan KIM
 
 ### Technical Support
-- **Tinysoft (Shenzhen Tinysoft Co., Ltd. / 深圳天软科技有限公司)**
+- **Tinysoft (Shenzhen Tinysoft Co., Ltd. / 深圳市天软科技有限公司)**
   - **Tianhua CHEN** - TinySoft API integration and support
   - **Jianglin CAI** - TinySoft API integration and support
 
