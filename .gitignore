@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+configs/runtime/runtime_env*.json
+scripts/shell/env.sh
+
+# Node modules (React frontend)
+Tradingsimulation/node_modules/
+Tradingsimulation/dist/
+Tradingsimulation/.vite/
+
+# Data files (large JSON/data files)
+*.json.gz
+*.csv.gz
+data/debug/
+backups/
+*.tar.gz
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
