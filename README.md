@@ -525,8 +525,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ### Open Source Community
 - The open-source libraries and frameworks that made this project possible
 - Community contributors and testers
-- We thank the HKUDS AI-Trader project team for their support in the implementation of tool functions.
-
+- We thank the HKUDS AI-Trader project team for providing reference implementations for certain auxiliary tool functions
 ---
 
 <div align="center">
