@@ -494,9 +494,16 @@ def plot_stock_attention(attention_data: Dict[datetime, Dict[str, int]]):
                 fontsize=18, fontweight='bold', pad=20)
     ax.grid(True, alpha=0.3, axis='y', linestyle='--', linewidth=0.8)
     
-    # 设置y轴上限（最多5个模型）
-    ax.set_ylim(0, 5)
-    ax.set_yticks([0, 1, 2, 3, 4, 5])
+    # 计算实际数据的最大值（每个时间点的总和）
+    max_total = 0
+    for t in times:
+        total = sum(attention_data[t].values())
+        max_total = max(max_total, total)
+    
+    # 动态设置y轴范围：使用实际最大值 + 1
+    y_max = max_total + 1
+    ax.set_ylim(0, y_max)
+    ax.set_yticks(range(0, y_max + 1))
     
     # 图例（放在右侧）
     ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10, 
