@@ -18,6 +18,157 @@
 
 </div>
 
+---
+
+## 📊 Performance Comparison Results
+
+**Updated: January 20, 2026**
+
+This section showcases comprehensive performance comparisons across Lite and Pro model versions, including benchmark analyses and portfolio dynamics during the 7-day trading period (January 12-20, 2026).
+
+### Dual Model Version Strategy
+
+AStock Arena supports two configurable model portfolios to optimize for different use cases:
+
+#### 🟢 **Lite Version** - Cost-Optimized Models
+
+The Lite version emphasizes cost-effectiveness while maintaining solid decision-making quality. It's ideal for frequent backtesting, parameter tuning, and large-scale experiments. All 5 Lite models run in parallel with identical market data, allowing fair performance comparison at lower API costs.
+
+**Models**: 
+- Claude Haiku 4.5
+- DeepSeek Chat
+- GPT-5.1
+- Qwen3-235b
+- Gemini 2.5 Flash
+
+##### Lite Version - Unrealized PnL (Market Price)
+![Lite Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized_lite.png)
+*Weekly unrealized returns using market prices at decision time. Shows real-time performance as if positions were liquidated at current market rates. 7-day period with 3 decision points daily (10:30, 11:30, 14:00 Beijing time).*
+
+##### Lite Version - Realized PnL (Cost Price)
+![Lite Realized PnL](experiments/visualizations/pnl_weekly_realized_lite.png)
+*Weekly realized returns using cost basis. Shows the value of closed positions and the cost of open positions. Represents the actual profit/loss from executed trades without mark-to-market volatility.*
+
+---
+
+#### 🔵 **Pro Version** - Advanced Models
+
+The Pro version leverages cutting-edge reasoning and planning capabilities. It's recommended for production trading and serious research requiring maximum decision quality. These advanced models demonstrate superior strategic planning in complex market scenarios.
+
+**Models**:
+- Claude Opus 4.5
+- DeepSeek Reasoner
+- GPT-5.2
+- Qwen3-Max
+- Gemini 3 Pro Preview
+
+##### Pro Version - Unrealized PnL (Market Price)
+![Pro Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized_pro.png)
+*Weekly unrealized returns for Pro models using market prices. Advanced reasoning models typically show more consistent performance with better risk management and market timing.*
+
+##### Pro Version - Realized PnL (Cost Price)
+![Pro Realized PnL](experiments/visualizations/pnl_weekly_realized_pro.png)
+*Weekly realized returns for Pro models using cost basis. Demonstrates the effectiveness of advanced models in actual trade execution and position management.*
+
+---
+
+#### 📈 **Model Version Performance Uplift**
+
+The chart below directly compares each Lite model against its corresponding Pro upgrade, highlighting the performance improvement from using more capable LLMs:
+
+![Model Version Comparison](experiments/visualizations/model_version_comparison.png)
+*5-subplot comparison (Lite vs Pro): Claude Haiku→Opus, DeepSeek Chat→Reasoner, GPT-5.1→5.2, Qwen3-235b→Max, Gemini 2.5→3-Pro. Gray represents Lite performance, colored lines represent Pro performance for each model family.*
+
+---
+
+### Benchmark Comparisons
+
+#### 📊 AI Models vs Market Benchmarks (All Models)
+
+The system compares AI-driven trading performance against established market benchmarks using unrealized (mark-to-market) pricing for fair comparison:
+
+![ETF vs Models Comparison](experiments/visualizations/etf_vs_models_comparison.png)
+*Performance comparison: All 10 AI models vs equal-weight 10-stock ETF vs SSE STAR Market 50 Index (科创50). Shows whether AI trading can outperform passive index strategies.*
+
+**Benchmark Components**:
+- **AI Models**: All 5 Lite + 5 Pro models competing simultaneously
+- **Equal-Weight ETF**: Baseline portfolio of 10 SSE STAR Market stocks
+  - SH688008, SH688111, SH688348, SH688363, SH688459
+  - SH688545, SH688595, SH688660, SH688680, SH688180
+- **SSE STAR Market 50 Index (科创50)**: China's premium growth-oriented market index, sourced via AKShare for reliable real-time data
+
+#### 📊 Lite vs Pro Benchmarks Comparison
+
+Side-by-side comparison of Lite and Pro model versions against market benchmarks. This dual-panel visualization clearly shows performance differences between cost-optimized and advanced models:
+
+![Benchmarks Lite vs Pro Comparison](experiments/visualizations/benchmarks_lite_vs_pro.png)
+*Left panel: 5 Lite models (Haiku, Chat, GPT-5.1, Qwen3-235b, Gemini 2.5 Flash) vs ETF and 科创50. Right panel: 5 Pro models (Opus, Reasoner, GPT-5.2, Qwen3-Max, Gemini 3-Pro) vs same benchmarks. Direct visual comparison of model version upgrade effects on benchmark performance.*
+
+This chart enables easy assessment of:
+- Whether Lite models can compete with passive benchmarks
+- Whether Pro models demonstrate significant improvement over benchmarks
+- The performance gap between Lite and Pro versions relative to market indices
+
+#### 🎯 Stock Selection Analysis
+
+![Stock Attention Heatmap](experiments/visualizations/stock_attention.png)
+*Stock selection patterns: Shows which stocks were most frequently held across all models during the trading period. Darker colors indicate higher model consensus and more frequent selection, revealing market preferences and perceived value opportunities.*
+
+#### 📅 Daily Portfolio Dynamics
+
+![Model Attention by Date](experiments/visualizations/model_attention_by_date.png)
+*Temporal allocation patterns: How model allocations evolved day-by-day during the 7-day trading period. Each color represents a stock, showing portfolio composition changes in response to market conditions and decision-making processes. Wider bands indicate more concentrated positions.*
+
+---
+
+#### 💾 ETF Performance Baseline
+
+![ETF Performance](experiments/visualizations/etf_performance.png)
+*Equal-weight ETF returns over the 7-day period. Provides a buy-and-hold baseline for comparison. A score of 0% represents holding the equal-weight basket unchanged throughout the period, showing the reference return without any active trading.*
+
+---
+
+### Performance Metrics & Statistics
+
+Complete performance statistics including:
+- **Daily Returns**: Day-by-day performance breakdown
+- **Cumulative Return**: Total return over the 7-day period
+- **Win Rate**: Percentage of profitable trading days
+- **Maximum Drawdown**: Largest peak-to-trough decline
+- **Volatility**: Standard deviation of returns
+- **Sharpe Ratio**: Risk-adjusted return metric
+
+Full report available in:
+📄 [Performance Summary Report](experiments/visualizations/performance_summary.md)
+
+---
+
+### How to Generate Your Own Visualizations
+
+Generate all visualizations with default (Lite) benchmarks:
+```bash
+python3 experiments/visualize.py
+```
+
+Generate visualizations with Pro models as benchmark reference:
+```bash
+MODEL_VERSION=pro python3 experiments/visualize.py
+```
+
+This creates 11 comprehensive outputs:
+- **4 PnL comparison charts**: Lite unrealized, Lite realized, Pro unrealized, Pro realized
+- **2 Benchmark comparison charts**: 
+  - All models vs ETF & 科创50
+  - Lite & Pro side-by-side vs benchmarks (NEW)
+- **1 ETF performance baseline**
+- **1 Model version comparison**: Lite vs Pro upgrade effects
+- **2 Portfolio analysis charts**: Stock selection & daily dynamics
+- **1 Statistical summary report**
+
+Total visualizations: **11 PNG/MD files** ready for analysis and presentation
+
+---
+
 ## 📋 Table of Contents
 
 - [Overview](#-overview)
