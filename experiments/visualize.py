@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple
 import numpy as np
 from scipy.interpolate import make_interp_spline
+import pandas as pd
 
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
@@ -28,8 +29,47 @@ PNL_SNAPSHOTS_DIR = PROJECT_ROOT / "data_flow" / "pnl_snapshots"
 # Legacy data directories (for backward compatibility)
 DATA_DATES = [f"data_{day}_1_2026" for day in range(12, 17)]
 
+# 10只股票（等权重ETF组成）
+ETF_STOCKS = [
+    "SH688008",  # 澜起科技
+    "SH688111",  # 金山办公
+    "SH688009",  # 中国通号
+    "SH688981",  # 中芯国际
+    "SH688256",  # 寒武纪
+    "SH688271",  # 联影医疗
+    "SH688047",  # 龙芯中科
+    "SH688617",  # 惠泰医疗
+    "SH688303",  # 大全能源
+    "SH688180",  # 君实生物
+]
 
-MODELS = {
+
+# 低配版模型（Lite版本）
+MODELS_LITE = {
+    "claude-haiku-4-5": {
+        "color": "#8B5CF6", 
+        "label": "Claude Haiku 4.5"
+    },
+    "deepseek-chat": {
+        "color": "#F59E0B", 
+        "label": "DeepSeek Chat"
+    },
+    "gpt-5.1": {
+        "color": "#3B82F6", 
+        "label": "GPT-5.1"
+    },
+    "qwen3-235b": {
+        "color": "#EF4444", 
+        "label": "Qwen3-235b"
+    },
+    "gemini-2.5-flash": {
+        "color": "#10B981", 
+        "label": "Gemini 2.5 Flash"
+    }
+}
+
+# 升级版模型（Pro版本）
+MODELS_PRO = {
     "claude-opus-4-5": {
         "color": "#8B5CF6", 
         "label": "Claude Opus 4.5"
@@ -51,6 +91,22 @@ MODELS = {
         "label": "Gemini 3 Pro Preview"
     }
 }
+
+# 模型版本对比映射
+MODEL_PAIRS = {
+    "claude-haiku-4-5": "claude-opus-4-5",
+    "deepseek-chat": "deepseek-reasoner",
+    "gpt-5.1": "gpt-5.2",
+    "qwen3-235b": "qwen3-max",
+    "gemini-2.5-flash": "gemini-3-pro-preview"
+}
+
+# 默认选择 Lite 版本，可通过环境变量或参数修改
+import os
+MODEL_VERSION = os.getenv("MODEL_VERSION", "lite").lower()
+MODELS = MODELS_LITE if MODEL_VERSION == "lite" else MODELS_PRO
+
+print(f"📌 Using {MODEL_VERSION.upper()} models: {list(MODELS.keys())}")
 
 INITIAL_CAPITAL = 1000000.0
 
@@ -234,22 +290,18 @@ def extract_unrealized_pnl() -> Dict[str, List[Tuple[datetime, float, float]]]:
     return all_pnl_data
 
 
-def extract_realized_pnl() -> Dict[str, List[Tuple[datetime, float, float]]]:
+def extract_unrealized_pnl_by_models(model_dict: Dict) -> Dict[str, List[Tuple[datetime, float, float]]]:
     """
-    提取 Realized PnL（基于成本价的权益）
-    从 position.jsonl 计算，使用成本价（avg_price）
+    提取指定模型字典中的 Unrealized PnL（浮动盈亏）
+    从 position.jsonl 计算，使用市场价格（decision_time 的价格）
     返回: {model_signature: [(datetime, equity, return_pct), ...]}
-    
-    Realized PnL = 现金 + 持仓成本（shares * avg_price）
-    这是已实现的权益，不会随市场价格浮动。
     """
     all_pnl_data = {}
     
-    for model_sig in MODELS.keys():
+    for model_sig in model_dict.keys():
         pnl_series = []
         
-        # 从 position.jsonl 计算（使用成本价）
-        # 优先使用新目录结构，如果不存在则尝试旧目录结构
+        # 从 position.jsonl 计算（使用市场价格）
         positions = read_position_data(model_sig)
         
         # 如果新目录没有数据，尝试旧目录结构（向后兼容）
@@ -260,7 +312,51 @@ def extract_realized_pnl() -> Dict[str, List[Tuple[datetime, float, float]]]:
                     break
         
         for pos in positions:
-            # 跳过seed记录
+            if pos.get('seed', False):
+                continue
+            
+            decision_time_str = pos.get('decision_time', '')
+            date_str = pos.get('date', '')
+            if not decision_time_str:
+                continue
+            
+            try:
+                dt = datetime.strptime(decision_time_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            
+            equity = calculate_equity_with_market_price(pos, decision_time_str, date_str)
+            return_pct = ((equity - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
+            pnl_series.append((dt, equity, return_pct))
+        
+        if pnl_series:
+            all_pnl_data[model_sig] = sorted(pnl_series, key=lambda x: x[0])
+    
+    return all_pnl_data
+
+
+def extract_realized_pnl_by_models(model_dict: Dict) -> Dict[str, List[Tuple[datetime, float, float]]]:
+    """
+    提取指定模型字典中的 Realized PnL（基于成本价的权益）
+    从 position.jsonl 计算，使用成本价（avg_price）
+    返回: {model_signature: [(datetime, equity, return_pct), ...]}
+    """
+    all_pnl_data = {}
+    
+    for model_sig in model_dict.keys():
+        pnl_series = []
+        
+        # 从 position.jsonl 计算（使用成本价）
+        positions = read_position_data(model_sig)
+        
+        # 如果新目录没有数据，尝试旧目录结构（向后兼容）
+        if not positions:
+            for data_dir in DATA_DATES:
+                positions = read_position_data(model_sig, data_dir)
+                if positions:
+                    break
+        
+        for pos in positions:
             if pos.get('seed', False):
                 continue
             
@@ -273,17 +369,26 @@ def extract_realized_pnl() -> Dict[str, List[Tuple[datetime, float, float]]]:
             except ValueError:
                 continue
             
-            # 使用成本价计算权益（不会随市场波动）
             equity = calculate_equity_with_cost_price(pos)
             return_pct = ((equity - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
-            
             pnl_series.append((dt, equity, return_pct))
         
         if pnl_series:
             all_pnl_data[model_sig] = sorted(pnl_series, key=lambda x: x[0])
-            print(f"✓ Loaded {len(pnl_series)} realized PnL points for {model_sig} (using cost price)")
     
     return all_pnl_data
+
+
+def extract_realized_pnl() -> Dict[str, List[Tuple[datetime, float, float]]]:
+    """
+    提取 Realized PnL（基于成本价的权益）
+    从 position.jsonl 计算，使用成本价（avg_price）
+    返回: {model_signature: [(datetime, equity, return_pct), ...]}
+    
+    Realized PnL = 现金 + 持仓成本（shares * avg_price）
+    这是已实现的权益，不会随市场价格浮动。
+    """
+    return extract_realized_pnl_by_models(MODELS)
 
 
 def extract_stock_attention() -> Dict[datetime, Dict[str, int]]:
@@ -572,8 +677,11 @@ def plot_stock_attention(attention_data: Dict[datetime, Dict[str, int]]):
 
 
 def plot_weekly_pnl(pnl_data: Dict[str, List[Tuple[datetime, float, float]]], 
-                     title: str, output_filename: str):
+                     title: str, output_filename: str, model_dict: Dict = None):
     """绘制 PnL 对比图（通用函数）"""
+    if model_dict is None:
+        model_dict = MODELS
+    
     fig, ax = plt.subplots(figsize=(16, 9))
     
     # 收集所有时间点用于创建统一的x轴标签
@@ -618,28 +726,31 @@ def plot_weekly_pnl(pnl_data: Dict[str, List[Tuple[datetime, float, float]]],
         x_indices = np.array(unique_indices)
         returns = np.array(unique_returns)
         
+        # 获取模型配置信息
+        model_info = model_dict.get(model_sig, model_dict.get(model_sig, MODELS.get(model_sig, {"color": "#999999", "label": model_sig})))
+        
         # 使用样条插值创建平滑曲线
         if len(x_indices) > 3:  # 样条插值至少需要4个点
             x_smooth = np.linspace(x_indices.min(), x_indices.max(), 300)
             spl = make_interp_spline(x_indices, returns, k=3)
             returns_smooth = spl(x_smooth)
             ax.plot(x_smooth, returns_smooth,
-                   color=MODELS[model_sig]["color"],
+                   color=model_info["color"],
                    linewidth=3,
                    linestyle='-',
                    alpha=0.9,
-                   label=MODELS[model_sig]["label"])
+                   label=model_info["label"])
         else:
             ax.plot(x_indices, returns,
-                   color=MODELS[model_sig]["color"],
+                   color=model_info["color"],
                    linewidth=3,
                    linestyle='-',
                    alpha=0.9,
-                   label=MODELS[model_sig]["label"])
+                   label=model_info["label"])
         
         # 添加数据点标记
         ax.scatter(x_indices, returns,
-                  color=MODELS[model_sig]["color"],
+                  color=model_info["color"],
                   s=50,
                   alpha=0.6,
                   zorder=5)
@@ -668,18 +779,32 @@ def plot_weekly_pnl(pnl_data: Dict[str, List[Tuple[datetime, float, float]]],
     plt.close()
 
 
-def plot_weekly_pnl_unrealized(pnl_data: Dict[str, List[Tuple[datetime, float, float]]]):
+def plot_weekly_pnl_unrealized(pnl_data: Dict[str, List[Tuple[datetime, float, float]]], model_dict: Dict = None, version: str = ""):
     """绘制 Unrealized PnL 对比图（使用市场价格，浮动盈亏）"""
+    if model_dict is None:
+        model_dict = MODELS
+    
+    version_suffix = f"_{version}" if version else ""
+    filename = f'pnl_weekly_unrealized{version_suffix}.png'
+    
     plot_weekly_pnl(pnl_data, 
                      'Weekly Unrealized PnL Comparison (Market Price, Date Range)',
-                     'pnl_weekly_unrealized.png')
+                     filename,
+                     model_dict)
 
 
-def plot_weekly_pnl_realized(pnl_data: Dict[str, List[Tuple[datetime, float, float]]]):
+def plot_weekly_pnl_realized(pnl_data: Dict[str, List[Tuple[datetime, float, float]]], model_dict: Dict = None, version: str = ""):
     """绘制 Realized PnL 对比图（使用成本价，已实现权益）"""
+    if model_dict is None:
+        model_dict = MODELS
+    
+    version_suffix = f"_{version}" if version else ""
+    filename = f'pnl_weekly_realized{version_suffix}.png'
+    
     plot_weekly_pnl(pnl_data,
                      'Weekly Realized PnL Comparison (Cost Price, Date Range)',
-                     'pnl_weekly_realized.png')
+                     filename,
+                     model_dict)
 
 
 def generate_summary_stats(pnl_data: Dict[str, List[Tuple[datetime, float, float]]]) -> str:
@@ -709,6 +834,737 @@ def generate_summary_stats(pnl_data: Dict[str, List[Tuple[datetime, float, float
     return "\n".join(summary_lines)
 
 
+def calculate_etf_price_series() -> List[Tuple[datetime, float]]:
+    """
+    计算10只股票的等权重ETF价格序列
+    从 ai_stock_data.json 中获取每只股票的价格数据（仅 2026-01-12 到 2026-01-20），等权重求平均
+    每天保留3个决策时点：10:30, 11:30, 14:00
+    返回: [(timestamp, etf_price), ...]
+    """
+    stock_data_path = PROJECT_ROOT / "data_flow" / "ai_stock_data.json"
+    if not stock_data_path.exists():
+        print("⚠️ Warning: ai_stock_data.json not found, skipping ETF calculation")
+        return []
+    
+    try:
+        with open(stock_data_path, 'r', encoding='utf-8') as f:
+            full_data = json.load(f)
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to read ai_stock_data.json: {e}")
+        return []
+    
+    # 日期范围限制
+    start_date = datetime.strptime("2026-01-12 00:00:00", "%Y-%m-%d %H:%M:%S")
+    end_date = datetime.strptime("2026-01-20 23:59:59", "%Y-%m-%d %H:%M:%S")
+    
+    # 决策时点（和前面两个图保持一致）
+    decision_times = ["10:30:00", "11:30:00", "14:00:00"]
+    
+    # 为每只股票收集历史价格数据
+    stock_prices = {symbol: {} for symbol in ETF_STOCKS}
+    
+    for symbol in ETF_STOCKS:
+        if symbol not in full_data:
+            print(f"⚠️ Warning: {symbol} not found in ai_stock_data.json")
+            continue
+        
+        stock_data = full_data[symbol]
+        if not isinstance(stock_data, dict):
+            continue
+        
+        # 优先使用小时线行情，其次是日线行情
+        price_data = stock_data.get('小时线行情') or stock_data.get('日线行情') or []
+        
+        for candle in price_data:
+            # 时间字段可能是 'date' 或 'time'
+            timestamp = candle.get('date') or candle.get('time')
+            close_price = float(candle.get('close', 0))
+            
+            if timestamp and close_price > 0:
+                try:
+                    dt = datetime.strptime(timestamp[:19], '%Y-%m-%d %H:%M:%S')
+                    # 只保留 2026-01-12 到 2026-01-20 的数据
+                    if start_date <= dt <= end_date:
+                        # 只保留决策时点的数据
+                        time_str = dt.strftime('%H:%M:%S')
+                        if time_str in decision_times:
+                            stock_prices[symbol][timestamp] = close_price
+                except:
+                    continue
+    
+    # 合并所有时间戳
+    all_timestamps = set()
+    for prices_dict in stock_prices.values():
+        all_timestamps.update(prices_dict.keys())
+    
+    if not all_timestamps:
+        print("⚠️ Warning: No price data found for ETF stocks in date range 2026-01-12 to 2026-01-20")
+        return []
+    
+    # 排序时间戳并计算每个时刻的等权重ETF价格
+    sorted_timestamps = sorted(all_timestamps)
+    etf_series = []
+    
+    for ts in sorted_timestamps:
+        prices = []
+        for symbol in ETF_STOCKS:
+            if ts in stock_prices[symbol]:
+                prices.append(stock_prices[symbol][ts])
+        
+        if prices:  # 只要有数据就计算平均
+            avg_price = np.mean(prices)
+            # 解析时间戳
+            try:
+                dt = datetime.strptime(ts[:19], '%Y-%m-%d %H:%M:%S')
+            except:
+                continue
+            
+            etf_series.append((dt, avg_price))
+    
+    print(f"✓ ETF series: {len(etf_series)} data points from {etf_series[0][0]} to {etf_series[-1][0]}")
+    
+    return etf_series
+
+
+def fetch_kechuang50_index_series() -> List[Tuple[datetime, float]]:
+    """
+    获取科创50指数数据（使用akshare）
+    指数代码: sh000688
+    返回: [(timestamp, close_price), ...]
+    """
+    try:
+        import akshare as ak
+        import pandas as pd
+        
+        print(f"📡 Fetching 科创50 index data from akshare (sh000688)...")
+        
+        # Fetch daily data from akshare
+        df = ak.stock_zh_index_daily(symbol='sh000688')
+        
+        # Convert date column to datetime
+        df['date'] = pd.to_datetime(df['date'])
+        
+        # Filter to our date range (2026-01-12 to 2026-01-20)
+        start_date = datetime.strptime("2026-01-12 00:00:00", "%Y-%m-%d %H:%M:%S")
+        end_date = datetime.strptime("2026-01-20 23:59:59", "%Y-%m-%d %H:%M:%S")
+        
+        df_filtered = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
+        
+        if df_filtered.empty:
+            print("⚠️ Warning: No 科创50 index data found for date range 2026-01-12 to 2026-01-20")
+            return []
+        
+        # Generate data points for each decision time on each day
+        # For daily data, we'll use the close price and replicate it for each decision time
+        # This is reasonable since we're comparing daily performance
+        decision_times = ["10:30:00", "11:30:00", "14:00:00"]
+        
+        index_series = []
+        for _, row in df_filtered.iterrows():
+            date_obj = row['date']
+            close_price = float(row['close'])
+            
+            # Create entries for each decision time on this day
+            for time_str in decision_times:
+                # Parse time and combine with date
+                time_parts = time_str.split(':')
+                dt = date_obj.replace(
+                    hour=int(time_parts[0]),
+                    minute=int(time_parts[1]),
+                    second=int(time_parts[2])
+                )
+                index_series.append((dt, close_price))
+        
+        # Sort by datetime
+        index_series = sorted(index_series, key=lambda x: x[0])
+        
+        if index_series:
+            print(f"✓ 科创50 index series: {len(index_series)} data points from {index_series[0][0]} to {index_series[-1][0]}")
+        
+        return index_series
+        
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to fetch 科创50 index data from akshare: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def calculate_etf_return_series(etf_series: List[Tuple[datetime, float]]) -> Dict[str, List[Tuple[datetime, float]]]:
+    """
+    计算ETF的收益率序列
+    以 2026-01-12 第一个价格作为基准价格（初始价格）
+    返回: {
+        'etf': [(datetime, etf_price), ...],
+        'return_pct': [(datetime, return_pct), ...]
+    }
+    """
+    if not etf_series:
+        return {}
+    
+    # 按时间排序
+    etf_series = sorted(etf_series, key=lambda x: x[0])
+    
+    # 计算收益率（相对 2026-01-12 的第一个价格作为初始价格）
+    initial_price = etf_series[0][1]
+    
+    if initial_price <= 0:
+        print(f"⚠️ Warning: Invalid initial price {initial_price}")
+        return {}
+    
+    return_pct_series = []
+    
+    for dt, price in etf_series:
+        if price > 0:
+            # 收益率 = (当前价格 - 初始价格) / 初始价格 * 100
+            return_pct = ((price - initial_price) / initial_price) * 100
+        else:
+            return_pct = 0
+        return_pct_series.append((dt, return_pct))
+    
+    print(f"✓ ETF return series: initial_price={initial_price:.2f}, final_price={etf_series[-1][1]:.2f}, final_return={return_pct_series[-1][1]:.2f}%")
+    
+    return {
+        'etf': etf_series,
+        'return_pct': return_pct_series
+    }
+
+
+def plot_etf_performance(etf_data: Dict):
+    """
+    绘制10只股票等权重ETF的表现图表
+    包含: ETF价格、收益率（使用样条曲线，每天3个决策点）
+    """
+    if not etf_data or 'return_pct' not in etf_data:
+        print("⚠️ Warning: No ETF data to plot")
+        return
+    
+    etf_series = etf_data.get('etf', [])
+    return_series = etf_data.get('return_pct', [])
+    
+    if not etf_series or not return_series:
+        return
+    
+    # 按时间排序
+    return_series = sorted(return_series, key=lambda x: x[0])
+    etf_series = sorted(etf_series, key=lambda x: x[0])
+    
+    # 收集所有时间点
+    all_times = set([dt for dt, _ in return_series])
+    sorted_times = sorted(all_times)
+    time_to_index = {dt: idx for idx, dt in enumerate(sorted_times)}
+    
+    # 提取数据（保留所有决策时点）
+    x_indices = [time_to_index[dt] for dt, _ in return_series]
+    returns = [ret for _, ret in return_series]
+    prices = [price for _, price in etf_series]
+    
+    # 创建图表
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    fig.suptitle('Equal-Weight ETF Performance (10 Stocks)', fontsize=16, fontweight='bold', y=0.995)
+    
+    # 图1: ETF价格走势（使用样条曲线）
+    ax1 = axes[0]
+    x_indices_arr = np.array(x_indices)
+    prices_arr = np.array(prices)
+    
+    if len(x_indices) > 3:
+        x_smooth = np.linspace(min(x_indices), max(x_indices), 300)
+        spl = make_interp_spline(x_indices_arr, prices_arr, k=3)
+        prices_smooth = spl(x_smooth)
+        ax1.plot(x_smooth, prices_smooth, linewidth=2.5, color='#2E86AB', label='ETF Value')
+    else:
+        ax1.plot(x_indices, prices, 'o-', linewidth=2.5, color='#2E86AB', label='ETF Value', markersize=4)
+    
+    ax1.scatter(x_indices, prices, color='#2E86AB', s=30, alpha=0.6, zorder=5)
+    ax1.set_ylabel('Value (¥)', fontsize=11)
+    ax1.set_title('Equal-Weight ETF Value Trend', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3, linestyle='--')
+    ax1.legend(fontsize=10)
+    
+    # 图2: 收益率走势（使用样条曲线）
+    ax2 = axes[1]
+    returns_arr = np.array(returns)
+    
+    if len(x_indices) > 3:
+        x_smooth = np.linspace(min(x_indices), max(x_indices), 300)
+        spl = make_interp_spline(x_indices_arr, returns_arr, k=3)
+        returns_smooth = spl(x_smooth)
+        ax2.plot(x_smooth, returns_smooth, linewidth=2.5, color='#4CAF50', label='Return')
+    else:
+        ax2.plot(x_indices, returns, 'o-', linewidth=2.5, color='#4CAF50', label='Return', markersize=4)
+    
+    ax2.scatter(x_indices, returns, color='#4CAF50', s=30, alpha=0.6, zorder=5)
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
+    ax2.set_xlabel('Date & Time', fontsize=11)
+    ax2.set_ylabel('Return (%)', fontsize=11)
+    ax2.set_title('Equal-Weight ETF Return Trend', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3, linestyle='--', axis='y')
+    ax2.legend(fontsize=10)
+    
+    # 设置x轴标签（显示日期和时间，和前两个图一样）
+    x_labels = [dt.strftime('%m-%d\n%H:%M') for dt in sorted_times]
+    x_positions = list(range(len(sorted_times)))
+    
+    ax1.set_xticks(x_positions)
+    ax1.set_xticklabels([])  # 上图不显示标签
+    ax2.set_xticks(x_positions)
+    ax2.set_xticklabels(x_labels, rotation=45, ha='right')
+    
+    plt.tight_layout()
+    
+    # 保存图表
+    output_file = OUTPUT_DIR / "etf_performance.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved: {output_file}")
+    plt.close()
+
+
+def calculate_kechuang50_return_series(kc50_series: List[Tuple[datetime, float]]) -> Dict[str, List[Tuple[datetime, float]]]:
+    """
+    计算科创50指数的收益率序列
+    以 2026-01-12 第一个价格作为基准价格（初始价格）
+    返回: {
+        'index': [(datetime, index_price), ...],
+        'return_pct': [(datetime, return_pct), ...]
+    }
+    """
+    if not kc50_series:
+        return {}
+    
+    # 按时间排序
+    kc50_series = sorted(kc50_series, key=lambda x: x[0])
+    
+    # 计算收益率（相对 2026-01-12 的第一个价格作为初始价格）
+    initial_price = kc50_series[0][1]
+    
+    if initial_price <= 0:
+        print(f"⚠️ Warning: Invalid initial price {initial_price}")
+        return {}
+    
+    return_pct_series = []
+    
+    for dt, price in kc50_series:
+        if price > 0:
+            # 收益率 = (当前价格 - 初始价格) / 初始价格 * 100
+            return_pct = ((price - initial_price) / initial_price) * 100
+        else:
+            return_pct = 0
+        return_pct_series.append((dt, return_pct))
+    
+    print(f"✓ 科创50 return series: initial_price={initial_price:.2f}, final_price={kc50_series[-1][1]:.2f}, final_return={return_pct_series[-1][1]:.2f}%")
+    
+    return {
+        'index': kc50_series,
+        'return_pct': return_pct_series
+    }
+
+
+def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, kc50_data: Dict = None):
+    """
+    对比ETF、科创50指数与各模型的表现（使用样条曲线，每天3个决策点）
+    使用 Unrealized PnL（市场价格）来展现模型的实际投资收益，包含买入时机效果
+    """
+    if not etf_data or not unrealized_pnl_data:
+        print("⚠️ Warning: Missing data for comparison chart")
+        return
+    
+    return_series = etf_data.get('return_pct', [])
+    if not return_series:
+        return
+    
+    return_series = sorted(return_series, key=lambda x: x[0])
+    
+    # 收集所有时间点
+    all_times = set()
+    for dt, _ in return_series:
+        all_times.add(dt)
+    for pnl_list in unrealized_pnl_data.values():
+        for dt, _, _ in pnl_list:
+            all_times.add(dt)
+    
+    # Add 科创50 times if available
+    kc50_return_series = []
+    if kc50_data and 'return_pct' in kc50_data:
+        kc50_return_series = sorted(kc50_data.get('return_pct', []), key=lambda x: x[0])
+        for dt, _ in kc50_return_series:
+            all_times.add(dt)
+    
+    sorted_times = sorted(all_times)
+    time_to_index = {dt: idx for idx, dt in enumerate(sorted_times)}
+    
+    # 创建图表
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    # 科创50指数数据处理（如果有的话）
+    if kc50_return_series:
+        kc50_x_indices = [time_to_index[dt] for dt, _ in kc50_return_series if dt in time_to_index]
+        kc50_returns = [ret for dt, ret in kc50_return_series if dt in time_to_index]
+        
+        if kc50_x_indices:
+            kc50_x_indices = np.array(kc50_x_indices)
+            kc50_returns = np.array(kc50_returns)
+            
+            # 绘制科创50（使用样条曲线，橙色系）
+            if len(kc50_x_indices) > 3:
+                x_smooth = np.linspace(kc50_x_indices.min(), kc50_x_indices.max(), 300)
+                spl = make_interp_spline(kc50_x_indices, kc50_returns, k=3)
+                returns_smooth = spl(x_smooth)
+                ax.plot(x_smooth, returns_smooth, linewidth=3.5, color='#FF6B35', 
+                        label='STAR 50 Index (SSE 688)', zorder=5, linestyle='--')
+            else:
+                ax.plot(kc50_x_indices, kc50_returns, 'o-', linewidth=3, color='#FF6B35',
+                        label='STAR 50 Index (SSE 688)', markersize=5, zorder=5, linestyle='--')
+            
+            ax.scatter(kc50_x_indices, kc50_returns, color='#FF6B35', s=50, alpha=0.7, zorder=6)
+    
+    # ETF数据处理（保留所有决策时点）
+    etf_x_indices = [time_to_index[dt] for dt, _ in return_series]
+    etf_returns = [ret for _, ret in return_series]
+    
+    etf_x_indices = np.array(etf_x_indices)
+    etf_returns = np.array(etf_returns)
+    
+    # 绘制ETF（使用样条曲线，改用蓝色系）
+    if len(etf_x_indices) > 3:
+        x_smooth = np.linspace(etf_x_indices.min(), etf_x_indices.max(), 300)
+        spl = make_interp_spline(etf_x_indices, etf_returns, k=3)
+        returns_smooth = spl(x_smooth)
+        ax.plot(x_smooth, returns_smooth, linewidth=3.5, color='#2E86AB', 
+                label='Equal-Weight ETF (10 Stocks)', zorder=5)
+    else:
+        ax.plot(etf_x_indices, etf_returns, 'o-', linewidth=3, color='#2E86AB',
+                label='Equal-Weight ETF (10 Stocks)', markersize=5, zorder=5)
+    
+    ax.scatter(etf_x_indices, etf_returns, color='#2E86AB', s=50, alpha=0.7, zorder=6)
+    
+    # 绘制各模型（使用样条曲线）
+    for model_sig, pnl_list in unrealized_pnl_data.items():
+        if not pnl_list:
+            continue
+        
+        pnl_list = sorted(pnl_list, key=lambda x: x[0])
+        
+        # 提取数据（保留所有决策时点）
+        model_x_indices = []
+        model_returns = []
+        
+        for dt, _, ret_pct in pnl_list:
+            if dt in time_to_index:
+                idx = time_to_index[dt]
+                model_x_indices.append(idx)
+                model_returns.append(ret_pct)
+        
+        if not model_x_indices:
+            continue
+        
+        model_x_indices = np.array(model_x_indices)
+        model_returns = np.array(model_returns)
+        
+        model_info = MODELS.get(model_sig, {})
+        label = model_info.get('label', model_sig)
+        color = model_info.get('color', '#000000')
+        
+        # 使用样条曲线
+        if len(model_x_indices) > 3:
+            x_smooth = np.linspace(model_x_indices.min(), model_x_indices.max(), 300)
+            spl = make_interp_spline(model_x_indices, model_returns, k=3)
+            returns_smooth = spl(x_smooth)
+            ax.plot(x_smooth, returns_smooth, linewidth=2.5, color=color, 
+                    label=label, alpha=0.85, zorder=3)
+        else:
+            ax.plot(model_x_indices, model_returns, 'o-', linewidth=2, color=color, 
+                    label=label, markersize=4, alpha=0.8, zorder=3)
+        
+        ax.scatter(model_x_indices, model_returns, color=color, s=30, alpha=0.5, zorder=4)
+    
+    ax.set_ylabel('Return (%)', fontsize=12)
+    ax.set_title('AI Trading Models vs Equal-Weight ETF Performance', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend(fontsize=10, loc='best')
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
+    
+    # 设置x轴标签（和前两个图一样）
+    x_labels = [dt.strftime('%m-%d\n%H:%M') for dt in sorted_times]
+    x_positions = list(range(len(sorted_times)))
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(x_labels, rotation=45, ha='right')
+    ax.set_xlabel('Date & Time', fontsize=12)
+    
+    plt.tight_layout()
+    
+    # 保存图表
+    output_file = OUTPUT_DIR / "etf_vs_models_comparison.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved: {output_file}")
+    plt.close()
+
+
+def plot_benchmarks_comparison(etf_data: Dict, lite_pnl_data: Dict, pro_pnl_data: Dict, kc50_data: Dict = None):
+    """
+    生成Lite和Pro两个版本的benchmark对比图
+    左图：Lite模型 vs ETF vs 科创50
+    右图：Pro模型 vs ETF vs 科创50
+    """
+    if not etf_data:
+        print("⚠️ Warning: Missing ETF data for benchmark comparison")
+        return
+    
+    return_series = etf_data.get('return_pct', [])
+    if not return_series:
+        return
+    
+    return_series = sorted(return_series, key=lambda x: x[0])
+    
+    # 创建双图表
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    
+    # 科创50数据处理
+    kc50_return_series = []
+    if kc50_data and 'return_pct' in kc50_data:
+        kc50_return_series = sorted(kc50_data.get('return_pct', []), key=lambda x: x[0])
+    
+    # 绘制Lite版本
+    ax = axes[0]
+    _plot_benchmark_single(ax, return_series, lite_pnl_data, kc50_return_series, "Lite Version")
+    
+    # 绘制Pro版本
+    ax = axes[1]
+    _plot_benchmark_single(ax, return_series, pro_pnl_data, kc50_return_series, "Pro Version")
+    
+    plt.tight_layout()
+    output_file = OUTPUT_DIR / "benchmarks_lite_vs_pro.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved: {output_file}")
+    plt.close()
+
+
+def _plot_benchmark_single(ax, etf_series, model_pnl_data, kc50_series, title_suffix):
+    """
+    绘制单个benchmark对比图（Lite或Pro）
+    """
+    # 收集所有时间点
+    all_times = set()
+    for dt, _ in etf_series:
+        all_times.add(dt)
+    for pnl_list in model_pnl_data.values():
+        for dt, _, _ in pnl_list:
+            all_times.add(dt)
+    for dt, _ in kc50_series:
+        all_times.add(dt)
+    
+    sorted_times = sorted(all_times)
+    time_to_index = {dt: idx for idx, dt in enumerate(sorted_times)}
+    
+    # 绘制科创50
+    if kc50_series:
+        kc50_x_indices = [time_to_index[dt] for dt, _ in kc50_series if dt in time_to_index]
+        kc50_returns = [ret for dt, ret in kc50_series if dt in time_to_index]
+        
+        if kc50_x_indices:
+            kc50_x_indices = np.array(kc50_x_indices)
+            kc50_returns = np.array(kc50_returns)
+            
+            if len(kc50_x_indices) > 3:
+                x_smooth = np.linspace(kc50_x_indices.min(), kc50_x_indices.max(), 300)
+                spl = make_interp_spline(kc50_x_indices, kc50_returns, k=3)
+                returns_smooth = spl(x_smooth)
+                ax.plot(x_smooth, returns_smooth, linewidth=3.5, color='#FF6B35', 
+                        label='STAR 50 Index (SSE 688)', zorder=5, linestyle='--')
+            
+            ax.scatter(kc50_x_indices, kc50_returns, color='#FF6B35', s=50, alpha=0.7, zorder=6)
+    
+    # 绘制ETF
+    etf_x_indices = [time_to_index[dt] for dt, _ in etf_series]
+    etf_returns = [ret for _, ret in etf_series]
+    
+    etf_x_indices = np.array(etf_x_indices)
+    etf_returns = np.array(etf_returns)
+    
+    if len(etf_x_indices) > 3:
+        x_smooth = np.linspace(etf_x_indices.min(), etf_x_indices.max(), 300)
+        spl = make_interp_spline(etf_x_indices, etf_returns, k=3)
+        returns_smooth = spl(x_smooth)
+        ax.plot(x_smooth, returns_smooth, linewidth=3.5, color='#2E86AB', 
+                label='Equal-Weight ETF (10 Stocks)', zorder=5)
+    
+    ax.scatter(etf_x_indices, etf_returns, color='#2E86AB', s=50, alpha=0.7, zorder=6)
+    
+    # 绘制模型（使用相应版本的配置）
+    if title_suffix == "Lite Version":
+        model_dict = MODELS_LITE
+    else:
+        model_dict = MODELS_PRO
+    
+    for model_sig, pnl_list in model_pnl_data.items():
+        if not pnl_list:
+            continue
+        
+        pnl_list = sorted(pnl_list, key=lambda x: x[0])
+        
+        model_x_indices = []
+        model_returns = []
+        
+        for dt, _, ret_pct in pnl_list:
+            if dt in time_to_index:
+                idx = time_to_index[dt]
+                model_x_indices.append(idx)
+                model_returns.append(ret_pct)
+        
+        if not model_x_indices:
+            continue
+        
+        model_x_indices = np.array(model_x_indices)
+        model_returns = np.array(model_returns)
+        
+        model_info = model_dict.get(model_sig, {})
+        label = model_info.get('label', model_sig)
+        color = model_info.get('color', '#000000')
+        
+        if len(model_x_indices) > 3:
+            x_smooth = np.linspace(model_x_indices.min(), model_x_indices.max(), 300)
+            spl = make_interp_spline(model_x_indices, model_returns, k=3)
+            returns_smooth = spl(x_smooth)
+            ax.plot(x_smooth, returns_smooth, linewidth=2.5, color=color, 
+                    label=label, alpha=0.85, zorder=3)
+        else:
+            ax.plot(model_x_indices, model_returns, 'o-', linewidth=2, color=color, 
+                    label=label, markersize=4, alpha=0.8, zorder=3)
+        
+        ax.scatter(model_x_indices, model_returns, color=color, s=30, alpha=0.5, zorder=4)
+    
+    ax.set_ylabel('Return (%)', fontsize=11)
+    ax.set_title(f'{title_suffix}: Models vs Benchmarks', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend(fontsize=9, loc='best')
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
+    
+    # 设置x轴标签
+    x_labels = [dt.strftime('%m-%d\n%H:%M') for dt in sorted_times]
+    x_positions = list(range(len(sorted_times)))
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=9)
+    ax.set_xlabel('Date & Time', fontsize=11)
+
+
+def plot_model_version_comparison(lite_pnl_data: Dict, pro_pnl_data: Dict):
+    """
+    对比低配版（Lite）和升级版（Pro）模型的表现
+    显示同系列模型的升级效果
+    """
+    if not lite_pnl_data or not pro_pnl_data:
+        print("⚠️ Warning: Missing data for model version comparison")
+        return
+    
+    # 收集所有时间点
+    all_times = set()
+    for pnl_list in lite_pnl_data.values():
+        for dt, _, _ in pnl_list:
+            all_times.add(dt)
+    for pnl_list in pro_pnl_data.values():
+        for dt, _, _ in pnl_list:
+            all_times.add(dt)
+    
+    sorted_times = sorted(all_times)
+    time_to_index = {dt: idx for idx, dt in enumerate(sorted_times)}
+    
+    # 创建图表
+    fig, axes = plt.subplots(1, 5, figsize=(20, 6))
+    
+    # 对每个模型系列绘制对比
+    model_names = list(MODEL_PAIRS.keys())
+    
+    for idx, (lite_model, ax) in enumerate(zip(model_names, axes)):
+        pro_model = MODEL_PAIRS[lite_model]
+        
+        # 获取 Lite 版本数据
+        if lite_model in lite_pnl_data:
+            lite_list = lite_pnl_data[lite_model]
+            lite_x_indices = []
+            lite_returns = []
+            for dt, _, ret_pct in lite_list:
+                if dt in time_to_index:
+                    lite_x_indices.append(time_to_index[dt])
+                    lite_returns.append(ret_pct)
+            
+            if lite_x_indices:
+                lite_x_indices = np.array(lite_x_indices)
+                lite_returns = np.array(lite_returns)
+                
+                # 绘制 Lite 版本
+                if len(lite_x_indices) > 3:
+                    x_smooth = np.linspace(lite_x_indices.min(), lite_x_indices.max(), 300)
+                    spl = make_interp_spline(lite_x_indices, lite_returns, k=3)
+                    returns_smooth = spl(x_smooth)
+                    ax.plot(x_smooth, returns_smooth, linewidth=2.5, color='#94A3B8', 
+                            label='Lite', alpha=0.8, zorder=3)
+                else:
+                    ax.plot(lite_x_indices, lite_returns, 'o-', linewidth=2, color='#94A3B8',
+                            label='Lite', markersize=4, alpha=0.8, zorder=3)
+                
+                ax.scatter(lite_x_indices, lite_returns, color='#94A3B8', s=30, alpha=0.5, zorder=4)
+        
+        # 获取 Pro 版本数据
+        if pro_model in pro_pnl_data:
+            pro_list = pro_pnl_data[pro_model]
+            pro_x_indices = []
+            pro_returns = []
+            for dt, _, ret_pct in pro_list:
+                if dt in time_to_index:
+                    pro_x_indices.append(time_to_index[dt])
+                    pro_returns.append(ret_pct)
+            
+            if pro_x_indices:
+                pro_x_indices = np.array(pro_x_indices)
+                pro_returns = np.array(pro_returns)
+                
+                # 获取模型配置中的颜色
+                lite_model_info = MODELS_LITE.get(lite_model, {})
+                color = lite_model_info.get('color', '#000000')
+                
+                # 绘制 Pro 版本
+                if len(pro_x_indices) > 3:
+                    x_smooth = np.linspace(pro_x_indices.min(), pro_x_indices.max(), 300)
+                    spl = make_interp_spline(pro_x_indices, pro_returns, k=3)
+                    returns_smooth = spl(x_smooth)
+                    ax.plot(x_smooth, returns_smooth, linewidth=2.5, color=color, 
+                            label='Pro', alpha=0.9, zorder=3)
+                else:
+                    ax.plot(pro_x_indices, pro_returns, 'o-', linewidth=2, color=color,
+                            label='Pro', markersize=4, alpha=0.9, zorder=3)
+                
+                ax.scatter(pro_x_indices, pro_returns, color=color, s=30, alpha=0.6, zorder=4)
+        
+        # 设置子图属性
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.set_ylabel('Return (%)', fontsize=10)
+        
+        # 使用简短的标签
+        lite_label = lite_model.split('-')[0].capitalize()
+        ax.set_title(f'{lite_label}: Lite vs Pro', fontsize=11, fontweight='bold')
+        ax.legend(fontsize=9, loc='best')
+    
+    # 设置 x 轴标签（仅在最后一个子图显示）
+    x_labels = [dt.strftime('%m-%d\n%H:%M') if i % 3 == 0 else '' 
+                for i, dt in enumerate(sorted_times)]
+    x_positions = list(range(len(sorted_times)))
+    
+    for ax in axes:
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=8)
+        ax.set_xlabel('Date & Time', fontsize=9)
+    
+    fig.suptitle('Model Version Comparison: Lite vs Pro', fontsize=15, fontweight='bold', y=1.00)
+    plt.tight_layout()
+    
+    # 保存图表
+    output_file = OUTPUT_DIR / "model_version_comparison.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved: {output_file}")
+    plt.close()
+
+
 def main():
     """主函数"""
     print("=" * 60)
@@ -716,33 +1572,79 @@ def main():
     print("=" * 60)
     print()
     
-    # 1. 提取 Unrealized PnL 数据（使用市场价格，浮动盈亏）
-    print("📥 Extracting Unrealized PnL data from position files (market price)...")
-    unrealized_pnl_data = extract_unrealized_pnl()
+    # 0. 提取两个版本的模型数据
+    print("📥 Extracting data for both model versions...\n")
     
-    if not unrealized_pnl_data:
-        print("⚠ Warning: No unrealized PnL data found.")
+    # 提取 Lite 版本的 Unrealized 和 Realized PnL
+    print("  📊 Lite models (Haiku, Chat, 5.1, 235b, Flash):")
+    lite_unrealized_pnl = extract_unrealized_pnl_by_models(MODELS_LITE)
+    lite_realized_pnl = extract_realized_pnl_by_models(MODELS_LITE)
+    print(f"    ✓ Loaded {len(lite_unrealized_pnl)} Lite models (unrealized)")
+    print(f"    ✓ Loaded {len(lite_realized_pnl)} Lite models (realized)\n")
+    
+    # 提取 Pro 版本的 Unrealized 和 Realized PnL
+    print("  📊 Pro models (Opus, Reasoner, 5.2, Max, 3-Pro):")
+    pro_unrealized_pnl = extract_unrealized_pnl_by_models(MODELS_PRO)
+    pro_realized_pnl = extract_realized_pnl_by_models(MODELS_PRO)
+    print(f"    ✓ Loaded {len(pro_unrealized_pnl)} Pro models (unrealized)")
+    print(f"    ✓ Loaded {len(pro_realized_pnl)} Pro models (realized)\n")
+    
+    # 使用当前选定的模型版本进行后续可视化
+    if MODEL_VERSION == "lite":
+        unrealized_pnl_data = lite_unrealized_pnl
+        realized_pnl_data = lite_realized_pnl
     else:
-        print(f"\n✓ Loaded unrealized PnL data for {len(unrealized_pnl_data)} models\n")
+        unrealized_pnl_data = pro_unrealized_pnl
+        realized_pnl_data = pro_realized_pnl
     
-    # 2. 提取 Realized PnL 数据（使用成本价，已实现权益）
-    print("📥 Extracting Realized PnL data from position files (cost price)...")
-    realized_pnl_data = extract_realized_pnl()
+    print(f"📌 Proceeding with {MODEL_VERSION.upper()} models for main visualizations\n")
     
-    if not realized_pnl_data:
-        print("⚠ Warning: No realized PnL data found.")
+    # 3. 计算等权重ETF
+    print("📊 Calculating equal-weight ETF (10 stocks)...")
+    etf_series = calculate_etf_price_series()
+    if etf_series:
+        print(f"✓ ETF price series: {len(etf_series)} data points")
+        etf_data = calculate_etf_return_series(etf_series)
     else:
+        etf_data = {}
+        print("⚠ Warning: Failed to calculate ETF")
     
-        print(f"\n✓ Loaded realized PnL data for {len(realized_pnl_data)} models\n")
+    # 3.5 获取科创50指数数据
+    print("📊 Fetching 科创50 Index (SSE 688) data...")
+    kc50_series = fetch_kechuang50_index_series()
+    if kc50_series:
+        print(f"✓ 科创50 index series: {len(kc50_series)} data points")
+        kc50_data = calculate_kechuang50_return_series(kc50_series)
+    else:
+        kc50_data = {}
+        print("⚠ Warning: Failed to fetch 科创50 index data")
     
-    # 3. 生成图表
-    if unrealized_pnl_data:
-        print("📈 Generating weekly Unrealized PnL chart (market price)...")
-        plot_weekly_pnl_unrealized(unrealized_pnl_data)
+    # 4. 生成PnL对比图（4张：Lite Unrealized、Lite Realized、Pro Unrealized、Pro Realized）
+    print("\n📈 Generating Weekly PnL Charts (4 charts total):")
     
-    if realized_pnl_data:
-        print("📈 Generating weekly Realized PnL chart (cost price)...")
-        plot_weekly_pnl_realized(realized_pnl_data)
+    if lite_unrealized_pnl:
+        print("  📊 Lite Unrealized PnL...")
+        plot_weekly_pnl_unrealized(lite_unrealized_pnl, MODELS_LITE, "lite")
+    
+    if lite_realized_pnl:
+        print("  📊 Lite Realized PnL...")
+        plot_weekly_pnl_realized(lite_realized_pnl, MODELS_LITE, "lite")
+    
+    if pro_unrealized_pnl:
+        print("  📊 Pro Unrealized PnL...")
+        plot_weekly_pnl_unrealized(pro_unrealized_pnl, MODELS_PRO, "pro")
+    
+    if pro_realized_pnl:
+        print("  📊 Pro Realized PnL...")
+        plot_weekly_pnl_realized(pro_realized_pnl, MODELS_PRO, "pro")
+    
+    # 5. 生成其他图表
+    if etf_data:
+        print("📈 Generating ETF performance chart...")
+        plot_etf_performance(etf_data)
+        
+        print("📈 Generating ETF vs Models comparison chart (with 科创50)...")
+        plot_etf_vs_models(etf_data, unrealized_pnl_data, kc50_data)
     
     print("📊 Generating stock attention chart...")
     attention_data = extract_stock_attention()
@@ -752,13 +1654,26 @@ def main():
     model_attention = extract_model_attention_by_date()
     plot_model_attention_by_date(model_attention)
     
-    # 4. 生成统计摘要（优先使用 Realized PnL，如果没有则使用 Unrealized PnL）
+    # 4.5 生成模型版本对比图
+    print("📈 Generating Model Version Comparison chart (Lite vs Pro)...")
+    if lite_unrealized_pnl and pro_unrealized_pnl:
+        plot_model_version_comparison(lite_unrealized_pnl, pro_unrealized_pnl)
+    else:
+        print("⚠ Warning: Insufficient data for model version comparison")
+    
+    # 4.6 生成Lite和Pro的benchmark对比图
+    print("📈 Generating Benchmarks Comparison chart (Lite & Pro vs ETF & 科创50)...")
+    if etf_data and lite_unrealized_pnl and pro_unrealized_pnl:
+        plot_benchmarks_comparison(etf_data, lite_unrealized_pnl, pro_unrealized_pnl, kc50_data)
+    else:
+        print("⚠ Warning: Insufficient data for benchmarks comparison")
+    
+    # 5. 生成统计摘要（使用当前选定版本的Realized PnL）
     print("\n📊 Generating summary statistics...")
-    pnl_for_summary = realized_pnl_data if realized_pnl_data else unrealized_pnl_data
-    if not pnl_for_summary:
+    if not realized_pnl_data:
         print("⚠ Warning: No PnL data available for summary statistics.")
     else:
-        summary = generate_summary_stats(pnl_for_summary)
+        summary = generate_summary_stats(realized_pnl_data)
         summary_file = OUTPUT_DIR / "performance_summary.md"
         with open(summary_file, 'w', encoding='utf-8') as f:
             f.write(summary)
@@ -766,8 +1681,23 @@ def main():
     
     print("\n" + "=" * 60)
     print("✅ All visualizations generated successfully!")
+    print(f"📊 Generated charts (11 total):")
+    print(f"   • pnl_weekly_unrealized_lite.png (Lite Unrealized)")
+    print(f"   • pnl_weekly_realized_lite.png (Lite Realized)")
+    print(f"   • pnl_weekly_unrealized_pro.png (Pro Unrealized)")
+    print(f"   • pnl_weekly_realized_pro.png (Pro Realized)")
+    print(f"   • etf_performance.png")
+    print(f"   • etf_vs_models_comparison.png")
+    print(f"   • benchmarks_lite_vs_pro.png (⭐ NEW: Lite & Pro vs Benchmarks)")
+    print(f"   • model_version_comparison.png")
+    print(f"   • stock_attention.png")
+    print(f"   • model_attention_by_date.png")
+    print(f"   • performance_summary.md")
     print(f"📁 Output directory: {OUTPUT_DIR.absolute()}")
+    print(f"📌 Active model version for other benchmarks: {MODEL_VERSION.upper()}")
     print("=" * 60)
+
+
 
 
 if __name__ == "__main__":
