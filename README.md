@@ -87,16 +87,6 @@ The chart below directly compares each Lite model against its corresponding Pro 
 
 The system compares AI-driven trading performance against established market benchmarks using unrealized (mark-to-market) pricing for fair comparison:
 
-![ETF vs Models Comparison](experiments/visualizations/etf_vs_models_comparison.png)
-*Performance comparison: All 10 AI models vs equal-weight 10-stock ETF vs SSE STAR Market 50 Index (科创50). Shows whether AI trading can outperform passive index strategies.*
-
-**Benchmark Components**:
-- **AI Models**: All 5 Lite + 5 Pro models competing simultaneously
-- **Equal-Weight ETF**: Baseline portfolio of 10 SSE STAR Market stocks
-  - SH688008, SH688111, SH688348, SH688363, SH688459
-  - SH688545, SH688595, SH688660, SH688680, SH688180
-- **SSE STAR Market 50 Index (科创50)**: China's premium growth-oriented market index, sourced via AKShare for reliable real-time data
-
 #### 📊 Lite vs Pro Benchmarks Comparison
 
 Side-by-side comparison of Lite and Pro model versions against market benchmarks. This dual-panel visualization clearly shows performance differences between cost-optimized and advanced models:
