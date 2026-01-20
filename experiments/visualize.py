@@ -349,38 +349,67 @@ def extract_model_attention_by_date() -> Dict[str, Dict[str, int]]:
     for model_sig in MODELS.keys():
         model_attention[model_sig] = {}
         
-        # 遍历所有日期目录
-        for data_dir in DATA_DATES:
-            positions = read_position_data(model_sig, data_dir)
+        # 直接读取新目录结构的数据（包含所有日期），不需要遍历 DATA_DATES
+        # 如果新目录不存在，再尝试旧目录结构
+        positions = read_position_data(model_sig)
+        
+        # 如果新目录没有数据，尝试旧目录结构（向后兼容）
+        if not positions:
+            for data_dir in DATA_DATES:
+                positions = read_position_data(model_sig, data_dir)
+                if positions:
+                    break
+        
+        # 按日期分组统计
+        date_to_stocks_count = {}  # {date_str: [stocks_count_per_time, ...]}
+        
+        for pos in positions:
+            # 跳过seed记录
+            if pos.get('seed', False):
+                continue
             
-            # 提取日期
-            date_str = data_dir.replace('data_', '').replace('_2026', '')
-            
-            # 存储该日期每个时间点的持仓股票数
-            stocks_count_per_time = []
-            
-            for pos in positions:
-                # 跳过seed记录
-                if pos.get('seed', False):
+            # 从 position 记录中提取日期（格式：YYYY-MM-DD）
+            date_str = pos.get('date', '')
+            if not date_str:
+                # 如果没有日期字段，尝试从 decision_time 提取
+                decision_time_str = pos.get('decision_time', '')
+                if decision_time_str:
+                    try:
+                        dt = datetime.strptime(decision_time_str, "%Y-%m-%d %H:%M:%S")
+                        date_str = dt.strftime('%Y-%m-%d')
+                    except ValueError:
+                        continue
+                else:
                     continue
-                
-                # 统计该时间点持有的股票数
-                stocks_at_this_time = 0
-                positions_dict = pos.get('positions', {})
-                for symbol, info in positions_dict.items():
-                    if symbol != 'CASH' and isinstance(info, dict):
-                        shares = info.get('shares', 0)
-                        if shares > 0:  # 只统计持仓数大于0的股票
-                            stocks_at_this_time += 1
-                
-                stocks_count_per_time.append(stocks_at_this_time)
             
-            # 计算平均值（四舍五入到整数）
+            # 转换为与旧格式兼容的日期字符串（格式：DD_MM）
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                date_key = dt.strftime('%d_%m')
+            except ValueError:
+                continue
+            
+            # 统计该时间点持有的股票数
+            stocks_at_this_time = 0
+            positions_dict = pos.get('positions', {})
+            for symbol, info in positions_dict.items():
+                if symbol != 'CASH' and isinstance(info, dict):
+                    shares = info.get('shares', 0)
+                    if shares > 0:  # 只统计持仓数大于0的股票
+                        stocks_at_this_time += 1
+            
+            # 添加到对应日期的列表
+            if date_key not in date_to_stocks_count:
+                date_to_stocks_count[date_key] = []
+            date_to_stocks_count[date_key].append(stocks_at_this_time)
+        
+        # 计算每个日期的平均值
+        for date_key, stocks_count_per_time in date_to_stocks_count.items():
             if stocks_count_per_time:
                 avg_stocks = round(sum(stocks_count_per_time) / len(stocks_count_per_time))
-                model_attention[model_sig][date_str] = avg_stocks
+                model_attention[model_sig][date_key] = avg_stocks
             else:
-                model_attention[model_sig][date_str] = 0
+                model_attention[model_sig][date_key] = 0
     
     return model_attention
 
@@ -397,6 +426,17 @@ def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]]):
         all_dates.update(date_dict.keys())
     all_dates = sorted(list(all_dates), 
                        key=lambda x: datetime.strptime(x, '%d_%m'))  # 按日期排序
+    
+    # 动态生成标题：根据实际日期范围
+    if all_dates:
+        first_date = datetime.strptime(all_dates[0], '%d_%m')
+        last_date = datetime.strptime(all_dates[-1], '%d_%m')
+        if first_date.month == last_date.month:
+            title_date_range = f"Jan {first_date.day}-{last_date.day}, 2026"
+        else:
+            title_date_range = f"{first_date.strftime('%b %d')}-{last_date.strftime('%b %d')}, 2026"
+    else:
+        title_date_range = "Jan 12-16, 2026"  # 默认值
     
     # 创建图表
     fig, ax = plt.subplots(figsize=(14, 8))
@@ -426,13 +466,17 @@ def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]]):
     # 格式化
     ax.set_xlabel('Date', fontsize=14, fontweight='bold')
     ax.set_ylabel('Number of Stocks Held', fontsize=14, fontweight='bold')
-    ax.set_title('Model Stock Attention by Date (Jan 12-16, 2026)', 
+    ax.set_title(f'Model Stock Attention by Date ({title_date_range})', 
                 fontsize=18, fontweight='bold', pad=20)
     ax.grid(True, alpha=0.3, axis='y', linestyle='--', linewidth=0.8)
     
-    # 设置y轴（最多10支股票）
-    ax.set_ylim(0, 10)
-    ax.set_yticks([0, 2, 4, 6, 8, 10])
+    # 动态设置y轴范围
+    max_stocks = 0
+    for date_dict in model_attention.values():
+        max_stocks = max(max_stocks, max(date_dict.values(), default=0))
+    y_max = max(6, max_stocks + 1)
+    ax.set_ylim(0, y_max)
+    ax.set_yticks(range(0, y_max + 1))
     
     # 图例
     ax.legend(loc='upper left', fontsize=11, framealpha=0.95, edgecolor='gray')
@@ -452,6 +496,17 @@ def plot_stock_attention(attention_data: Dict[datetime, Dict[str, int]]):
     
     # 排序时间
     times = sorted(attention_data.keys())
+    
+    # 动态生成标题：根据实际日期范围
+    if times:
+        first_date = times[0]
+        last_date = times[-1]
+        if first_date.month == last_date.month:
+            title_date_range = f"{first_date.strftime('%b %d')}-{last_date.day}, {first_date.year}"
+        else:
+            title_date_range = f"{first_date.strftime('%b %d')}-{last_date.strftime('%b %d')}, {first_date.year}"
+    else:
+        title_date_range = "Jan 12-16, 2026"  # 默认值
     
     # 获取所有股票符号
     all_stocks = set()
@@ -490,7 +545,7 @@ def plot_stock_attention(attention_data: Dict[datetime, Dict[str, int]]):
     # 格式化
     ax.set_xlabel('Date & Time', fontsize=14, fontweight='bold')
     ax.set_ylabel('Number of Models Holding', fontsize=14, fontweight='bold')
-    ax.set_title('Stock Attention Over Time (Jan 12-16, 2026)', 
+    ax.set_title(f'Stock Attention Over Time ({title_date_range})', 
                 fontsize=18, fontweight='bold', pad=20)
     ax.grid(True, alpha=0.3, axis='y', linestyle='--', linewidth=0.8)
     
@@ -530,6 +585,17 @@ def plot_weekly_pnl(pnl_data: Dict[str, List[Tuple[datetime, float, float]]],
     # 按时间排序并创建索引映射
     sorted_times = sorted(all_times)
     time_to_index = {dt: idx for idx, dt in enumerate(sorted_times)}
+    
+    # 动态生成日期范围用于标题
+    if sorted_times:
+        first_date = sorted_times[0]
+        last_date = sorted_times[-1]
+        if first_date.month == last_date.month:
+            date_range = f"{first_date.strftime('%b %d')}-{last_date.day}, {first_date.year}"
+        else:
+            date_range = f"{first_date.strftime('%b %d')}-{last_date.strftime('%b %d')}, {first_date.year}"
+        # 替换标题中的 "Date Range" 占位符
+        title = title.replace('Date Range', date_range)
     
     for model_sig, data_points in pnl_data.items():
         if not data_points:
@@ -605,14 +671,14 @@ def plot_weekly_pnl(pnl_data: Dict[str, List[Tuple[datetime, float, float]]],
 def plot_weekly_pnl_unrealized(pnl_data: Dict[str, List[Tuple[datetime, float, float]]]):
     """绘制 Unrealized PnL 对比图（使用市场价格，浮动盈亏）"""
     plot_weekly_pnl(pnl_data, 
-                     'Weekly Unrealized PnL Comparison (Market Price, Jan 12-16, 2026)',
+                     'Weekly Unrealized PnL Comparison (Market Price, Date Range)',
                      'pnl_weekly_unrealized.png')
 
 
 def plot_weekly_pnl_realized(pnl_data: Dict[str, List[Tuple[datetime, float, float]]]):
     """绘制 Realized PnL 对比图（使用成本价，已实现权益）"""
     plot_weekly_pnl(pnl_data,
-                     'Weekly Realized PnL Comparison (Cost Price, Jan 12-16, 2026)',
+                     'Weekly Realized PnL Comparison (Cost Price, Date Range)',
                      'pnl_weekly_realized.png')
 
 
