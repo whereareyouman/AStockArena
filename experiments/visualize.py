@@ -23,6 +23,15 @@ PROJECT_ROOT = ROOT_DIR.parent
 OUTPUT_DIR = ROOT_DIR / "visualizations"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# Date range filter (inclusive)
+DATE_FILTER_START = datetime.strptime("2026-01-12 00:00:00", "%Y-%m-%d %H:%M:%S")
+DATE_FILTER_END = datetime.strptime("2026-01-21 23:59:59", "%Y-%m-%d %H:%M:%S")
+
+
+def in_date_range(dt: datetime) -> bool:
+    """Return True if dt is within configured date window (inclusive)."""
+    return DATE_FILTER_START <= dt <= DATE_FILTER_END
+
 # PnL snapshots directory
 PNL_SNAPSHOTS_DIR = PROJECT_ROOT / "data_flow" / "pnl_snapshots"
 
@@ -276,6 +285,9 @@ def extract_unrealized_pnl() -> Dict[str, List[Tuple[datetime, float, float]]]:
                 dt = datetime.strptime(decision_time_str, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
+
+            if not in_date_range(dt):
+                continue
             
             # 使用市场价格（决策时点的价格）计算权益
             equity = calculate_equity_with_market_price(pos, decision_time_str, date_str)
@@ -324,6 +336,9 @@ def extract_unrealized_pnl_by_models(model_dict: Dict) -> Dict[str, List[Tuple[d
                 dt = datetime.strptime(decision_time_str, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
+
+            if not in_date_range(dt):
+                continue
             
             equity = calculate_equity_with_market_price(pos, decision_time_str, date_str)
             return_pct = ((equity - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
@@ -368,6 +383,9 @@ def extract_realized_pnl_by_models(model_dict: Dict) -> Dict[str, List[Tuple[dat
                 dt = datetime.strptime(decision_time_str, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
+
+            if not in_date_range(dt):
+                continue
             
             equity = calculate_equity_with_cost_price(pos)
             return_pct = ((equity - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
@@ -391,15 +409,19 @@ def extract_realized_pnl() -> Dict[str, List[Tuple[datetime, float, float]]]:
     return extract_realized_pnl_by_models(MODELS)
 
 
-def extract_stock_attention() -> Dict[datetime, Dict[str, int]]:
+def extract_stock_attention(model_dict: Dict = None) -> Dict[datetime, Dict[str, int]]:
     """
     提取股票关注度数据（每个时间点，每支股票被多少个模型持有）
     返回: {datetime: {stock_symbol: num_models_holding, ...}, ...}
+    可通过 model_dict 指定模型子集（默认全量 MODELS）。
     """
+    if model_dict is None:
+        model_dict = MODELS
+
     # 使用嵌套字典存储：{datetime: {stock_symbol: set(models_holding)}}
     attention_data_sets = {}
     
-    for model_sig in MODELS.keys():
+    for model_sig in model_dict.keys():
         # 遍历所有日期目录
         for data_dir in DATA_DATES:
             positions = read_position_data(model_sig, data_dir)
@@ -416,6 +438,9 @@ def extract_stock_attention() -> Dict[datetime, Dict[str, int]]:
                 try:
                     dt = datetime.strptime(decision_time_str, "%Y-%m-%d %H:%M:%S")
                 except ValueError:
+                    continue
+                
+                if not in_date_range(dt):
                     continue
                 
                 # 初始化时间点的数据结构
@@ -444,39 +469,35 @@ def extract_stock_attention() -> Dict[datetime, Dict[str, int]]:
     return sorted_attention
 
 
-def extract_model_attention_by_date() -> Dict[str, Dict[str, int]]:
+def extract_model_attention_by_date(model_dict: Dict = None) -> Dict[str, Dict[str, int]]:
     """
     提取每个模型在每个日期的股票持有数（取每天各时间点的平均值）
     返回: {model_sig: {date_str: avg_num_stocks_held, ...}, ...}
+    可通过 model_dict 指定模型子集（默认全量 MODELS）。
     """
+    if model_dict is None:
+        model_dict = MODELS
+
     model_attention = {}
     
-    for model_sig in MODELS.keys():
+    for model_sig in model_dict.keys():
         model_attention[model_sig] = {}
         
-        # 直接读取新目录结构的数据（包含所有日期），不需要遍历 DATA_DATES
-        # 如果新目录不存在，再尝试旧目录结构
         positions = read_position_data(model_sig)
-        
-        # 如果新目录没有数据，尝试旧目录结构（向后兼容）
         if not positions:
             for data_dir in DATA_DATES:
                 positions = read_position_data(model_sig, data_dir)
                 if positions:
                     break
         
-        # 按日期分组统计
         date_to_stocks_count = {}  # {date_str: [stocks_count_per_time, ...]}
         
         for pos in positions:
-            # 跳过seed记录
             if pos.get('seed', False):
                 continue
             
-            # 从 position 记录中提取日期（格式：YYYY-MM-DD）
             date_str = pos.get('date', '')
             if not date_str:
-                # 如果没有日期字段，尝试从 decision_time 提取
                 decision_time_str = pos.get('decision_time', '')
                 if decision_time_str:
                     try:
@@ -487,28 +508,26 @@ def extract_model_attention_by_date() -> Dict[str, Dict[str, int]]:
                 else:
                     continue
             
-            # 转换为与旧格式兼容的日期字符串（格式：DD_MM）
             try:
                 dt = datetime.strptime(date_str, "%Y-%m-%d")
+                if not in_date_range(dt):
+                    continue
                 date_key = dt.strftime('%d_%m')
             except ValueError:
                 continue
             
-            # 统计该时间点持有的股票数
             stocks_at_this_time = 0
             positions_dict = pos.get('positions', {})
             for symbol, info in positions_dict.items():
                 if symbol != 'CASH' and isinstance(info, dict):
                     shares = info.get('shares', 0)
-                    if shares > 0:  # 只统计持仓数大于0的股票
+                    if shares > 0:
                         stocks_at_this_time += 1
             
-            # 添加到对应日期的列表
             if date_key not in date_to_stocks_count:
                 date_to_stocks_count[date_key] = []
             date_to_stocks_count[date_key].append(stocks_at_this_time)
         
-        # 计算每个日期的平均值
         for date_key, stocks_count_per_time in date_to_stocks_count.items():
             if stocks_count_per_time:
                 avg_stocks = round(sum(stocks_count_per_time) / len(stocks_count_per_time))
@@ -519,7 +538,7 @@ def extract_model_attention_by_date() -> Dict[str, Dict[str, int]]:
     return model_attention
 
 
-def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]]):
+def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]], output_filename: str = "model_attention_by_date.png", title_prefix: str = "Model Stock Attention by Date"):
     """绘制每个模型在不同日期的关注度（持有股票数）"""
     if not model_attention:
         print("⚠ No model attention data available")
@@ -551,14 +570,17 @@ def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]]):
     width = 0.15
     
     # 为每个模型绘制柱状图
-    for idx, model_sig in enumerate(sorted(MODELS.keys())):
+    model_sigs = sorted(model_attention.keys())
+    for idx, model_sig in enumerate(model_sigs):
         stocks_count = [model_attention.get(model_sig, {}).get(date, 0) 
                         for date in all_dates]
+        label = MODELS.get(model_sig, {}).get("label", model_sig)
+        color = MODELS.get(model_sig, {}).get("color", "#666666")
         
         ax.bar(x + idx * width, stocks_count,
                width=width,
-               label=MODELS[model_sig]["label"],
-               color=MODELS[model_sig]["color"],
+               label=label,
+               color=color,
                alpha=0.8,
                edgecolor='black',
                linewidth=0.5)
@@ -571,7 +593,7 @@ def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]]):
     # 格式化
     ax.set_xlabel('Date', fontsize=14, fontweight='bold')
     ax.set_ylabel('Number of Stocks Held', fontsize=14, fontweight='bold')
-    ax.set_title(f'Model Stock Attention by Date ({title_date_range})', 
+    ax.set_title(f'{title_prefix} ({title_date_range})', 
                 fontsize=18, fontweight='bold', pad=20)
     ax.grid(True, alpha=0.3, axis='y', linestyle='--', linewidth=0.8)
     
@@ -587,13 +609,13 @@ def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]]):
     ax.legend(loc='upper left', fontsize=11, framealpha=0.95, edgecolor='gray')
     
     plt.tight_layout()
-    output_path = OUTPUT_DIR / "model_attention_by_date.png"
+    output_path = OUTPUT_DIR / output_filename
     plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"✓ Saved: {output_path}")
     plt.close()
 
 
-def plot_stock_attention(attention_data: Dict[datetime, Dict[str, int]]):
+def plot_stock_attention(attention_data: Dict[datetime, Dict[str, int]], output_filename: str = "stock_attention.png", title_prefix: str = "Stock Attention Over Time"):
     """绘制股票关注度堆积面积图"""
     if not attention_data:
         print("⚠ No stock attention data available")
@@ -650,7 +672,7 @@ def plot_stock_attention(attention_data: Dict[datetime, Dict[str, int]]):
     # 格式化
     ax.set_xlabel('Date & Time', fontsize=14, fontweight='bold')
     ax.set_ylabel('Number of Models Holding', fontsize=14, fontweight='bold')
-    ax.set_title(f'Stock Attention Over Time ({title_date_range})', 
+    ax.set_title(f'{title_prefix} ({title_date_range})', 
                 fontsize=18, fontweight='bold', pad=20)
     ax.grid(True, alpha=0.3, axis='y', linestyle='--', linewidth=0.8)
     
@@ -670,7 +692,7 @@ def plot_stock_attention(attention_data: Dict[datetime, Dict[str, int]]):
              ncol=1, framealpha=0.95, edgecolor='gray')
     
     plt.tight_layout()
-    output_path = OUTPUT_DIR / "stock_attention.png"
+    output_path = OUTPUT_DIR / output_filename
     plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"✓ Saved: {output_path}")
     plt.close()
@@ -854,8 +876,8 @@ def calculate_etf_price_series() -> List[Tuple[datetime, float]]:
         return []
     
     # 日期范围限制
-    start_date = datetime.strptime("2026-01-12 00:00:00", "%Y-%m-%d %H:%M:%S")
-    end_date = datetime.strptime("2026-01-20 23:59:59", "%Y-%m-%d %H:%M:%S")
+    start_date = DATE_FILTER_START
+    end_date = DATE_FILTER_END
     
     # 决策时点（和前面两个图保持一致）
     decision_times = ["10:30:00", "11:30:00", "14:00:00"]
@@ -944,14 +966,11 @@ def fetch_kechuang50_index_series() -> List[Tuple[datetime, float]]:
         # Convert date column to datetime
         df['date'] = pd.to_datetime(df['date'])
         
-        # Filter to our date range (2026-01-12 to 2026-01-20)
-        start_date = datetime.strptime("2026-01-12 00:00:00", "%Y-%m-%d %H:%M:%S")
-        end_date = datetime.strptime("2026-01-20 23:59:59", "%Y-%m-%d %H:%M:%S")
-        
-        df_filtered = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
-        
+        # Filter to configured date range
+        df_filtered = df[(df['date'] >= DATE_FILTER_START) & (df['date'] <= DATE_FILTER_END)]
+
         if df_filtered.empty:
-            print("⚠️ Warning: No 科创50 index data found for date range 2026-01-12 to 2026-01-20")
+            print(f"⚠️ Warning: No 科创50 index data found for date range {DATE_FILTER_START.date()} to {DATE_FILTER_END.date()}")
             return []
         
         # Generate data points for each decision time on each day
@@ -1326,11 +1345,11 @@ def plot_benchmarks_comparison(etf_data: Dict, lite_pnl_data: Dict, pro_pnl_data
     
     # 绘制Lite版本
     ax = axes[0]
-    _plot_benchmark_single(ax, return_series, lite_pnl_data, kc50_return_series, "Lite Version")
+    _plot_benchmark_single(ax, return_series, lite_pnl_data, kc50_return_series, "Lite Version", MODELS_LITE)
     
     # 绘制Pro版本
     ax = axes[1]
-    _plot_benchmark_single(ax, return_series, pro_pnl_data, kc50_return_series, "Pro Version")
+    _plot_benchmark_single(ax, return_series, pro_pnl_data, kc50_return_series, "Pro Version", MODELS_PRO)
     
     plt.tight_layout()
     output_file = OUTPUT_DIR / "benchmarks_lite_vs_pro.png"
@@ -1339,7 +1358,42 @@ def plot_benchmarks_comparison(etf_data: Dict, lite_pnl_data: Dict, pro_pnl_data
     plt.close()
 
 
-def _plot_benchmark_single(ax, etf_series, model_pnl_data, kc50_series, title_suffix):
+def plot_benchmarks_realized(etf_data: Dict, lite_realized: Dict, pro_realized: Dict, kc50_data: Dict = None):
+    """
+    生成 Lite 和 Pro 版本的基准对比图（使用 Realized PnL）
+    左图：Lite realized vs ETF vs 科创50
+    右图：Pro realized vs ETF vs 科创50
+    """
+    if not etf_data:
+        print("⚠️ Warning: Missing ETF data for realized benchmark comparison")
+        return
+
+    return_series = etf_data.get('return_pct', [])
+    if not return_series:
+        return
+
+    return_series = sorted(return_series, key=lambda x: x[0])
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+
+    kc50_return_series = []
+    if kc50_data and 'return_pct' in kc50_data:
+        kc50_return_series = sorted(kc50_data.get('return_pct', []), key=lambda x: x[0])
+
+    ax = axes[0]
+    _plot_benchmark_single(ax, return_series, lite_realized, kc50_return_series, "Lite Version (Realized)", MODELS_LITE)
+
+    ax = axes[1]
+    _plot_benchmark_single(ax, return_series, pro_realized, kc50_return_series, "Pro Version (Realized)", MODELS_PRO)
+
+    plt.tight_layout()
+    output_file = OUTPUT_DIR / "benchmarks_lite_vs_pro_realized.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved: {output_file}")
+    plt.close()
+
+
+def _plot_benchmark_single(ax, etf_series, model_pnl_data, kc50_series, title_suffix, model_dict):
     """
     绘制单个benchmark对比图（Lite或Pro）
     """
@@ -1391,11 +1445,6 @@ def _plot_benchmark_single(ax, etf_series, model_pnl_data, kc50_series, title_su
     ax.scatter(etf_x_indices, etf_returns, color='#2E86AB', s=50, alpha=0.7, zorder=6)
     
     # 绘制模型（使用相应版本的配置）
-    if title_suffix == "Lite Version":
-        model_dict = MODELS_LITE
-    else:
-        model_dict = MODELS_PRO
-    
     for model_sig, pnl_list in model_pnl_data.items():
         if not pnl_list:
             continue
@@ -1646,13 +1695,22 @@ def main():
         print("📈 Generating ETF vs Models comparison chart (with 科创50)...")
         plot_etf_vs_models(etf_data, unrealized_pnl_data, kc50_data)
     
-    print("📊 Generating stock attention chart...")
-    attention_data = extract_stock_attention()
-    plot_stock_attention(attention_data)
+    print("📊 Generating stock attention charts (overall, Lite, Pro)...")
+    attention_data_all = extract_stock_attention()
+    plot_stock_attention(attention_data_all, "stock_attention.png", "Stock Attention Over Time (All Models)")
+
+    attention_data_lite = extract_stock_attention(MODELS_LITE)
+    plot_stock_attention(attention_data_lite, "stock_attention_lite.png", "Stock Attention Over Time (Lite)")
+
+    attention_data_pro = extract_stock_attention(MODELS_PRO)
+    plot_stock_attention(attention_data_pro, "stock_attention_pro.png", "Stock Attention Over Time (Pro)")
     
-    print("📊 Generating model attention by date chart...")
-    model_attention = extract_model_attention_by_date()
-    plot_model_attention_by_date(model_attention)
+    print("📊 Generating model attention by date charts (Lite, Pro)...")
+    model_attention_lite = extract_model_attention_by_date(MODELS_LITE)
+    plot_model_attention_by_date(model_attention_lite, "model_attention_by_date_lite.png", "Model Stock Attention by Date (Lite)")
+
+    model_attention_pro = extract_model_attention_by_date(MODELS_PRO)
+    plot_model_attention_by_date(model_attention_pro, "model_attention_by_date_pro.png", "Model Stock Attention by Date (Pro)")
     
     # 4.5 生成模型版本对比图
     print("📈 Generating Model Version Comparison chart (Lite vs Pro)...")
@@ -1667,6 +1725,13 @@ def main():
         plot_benchmarks_comparison(etf_data, lite_unrealized_pnl, pro_unrealized_pnl, kc50_data)
     else:
         print("⚠ Warning: Insufficient data for benchmarks comparison")
+
+    # 4.7 生成Lite和Pro的Realized benchmark对比图
+    print("📈 Generating Realized Benchmarks Comparison chart (Lite & Pro vs ETF & 科创50)...")
+    if etf_data and lite_realized_pnl and pro_realized_pnl:
+        plot_benchmarks_realized(etf_data, lite_realized_pnl, pro_realized_pnl, kc50_data)
+    else:
+        print("⚠ Warning: Insufficient data for realized benchmarks comparison")
     
     # 5. 生成统计摘要（使用当前选定版本的Realized PnL）
     print("\n📊 Generating summary statistics...")
@@ -1679,19 +1744,23 @@ def main():
             f.write(summary)
         print(f"✓ Saved: {summary_file}")
     
-    print("\n" + "=" * 60)
+    print(f"\n" + "=" * 60)
     print("✅ All visualizations generated successfully!")
-    print(f"📊 Generated charts (11 total):")
+    print(f"📊 Generated charts (16 total):")
     print(f"   • pnl_weekly_unrealized_lite.png (Lite Unrealized)")
     print(f"   • pnl_weekly_realized_lite.png (Lite Realized)")
     print(f"   • pnl_weekly_unrealized_pro.png (Pro Unrealized)")
     print(f"   • pnl_weekly_realized_pro.png (Pro Realized)")
     print(f"   • etf_performance.png")
     print(f"   • etf_vs_models_comparison.png")
-    print(f"   • benchmarks_lite_vs_pro.png (⭐ NEW: Lite & Pro vs Benchmarks)")
+    print(f"   • benchmarks_lite_vs_pro.png (Lite & Pro vs Benchmarks)")
+    print(f"   • benchmarks_lite_vs_pro_realized.png (Lite & Pro vs Benchmarks, Realized)")
     print(f"   • model_version_comparison.png")
-    print(f"   • stock_attention.png")
-    print(f"   • model_attention_by_date.png")
+    print(f"   • stock_attention.png (All Models)")
+    print(f"   • stock_attention_lite.png (Lite Models)")
+    print(f"   • stock_attention_pro.png (Pro Models)")
+    print(f"   • model_attention_by_date_lite.png (Lite Models)")
+    print(f"   • model_attention_by_date_pro.png (Pro Models)")
     print(f"   • performance_summary.md")
     print(f"📁 Output directory: {OUTPUT_DIR.absolute()}")
     print(f"📌 Active model version for other benchmarks: {MODEL_VERSION.upper()}")
