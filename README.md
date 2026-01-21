@@ -22,9 +22,9 @@
 
 ## 📊 Performance Comparison Results
 
-**Updated: January 20, 2026**
+**Updated: January 21, 2026**
 
-This section showcases comprehensive performance comparisons across Lite and Pro model versions, including benchmark analyses and portfolio dynamics during the 7-day trading period (January 12-20, 2026).
+This section showcases comprehensive performance comparisons across Lite and Pro model versions, including benchmark analyses and portfolio dynamics during the trading period (January 12-21, 2026).
 
 ### Dual Model Version Strategy
 
@@ -43,11 +43,11 @@ The Lite version emphasizes cost-effectiveness while maintaining solid decision-
 
 ##### Lite Version - Unrealized PnL (Market Price)
 ![Lite Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized_lite.png)
-*Weekly unrealized returns using market prices at decision time. Shows real-time performance as if positions were liquidated at current market rates. 7-day period with 3 decision points daily (10:30, 11:30, 14:00 Beijing time).*
+*Unrealized returns using market prices at decision time. Shows real-time performance as if positions were liquidated at current market rates. Trading period with 3 decision points daily (10:30, 11:30, 14:00 Beijing time).*
 
 ##### Lite Version - Realized PnL (Cost Price)
 ![Lite Realized PnL](experiments/visualizations/pnl_weekly_realized_lite.png)
-*Weekly realized returns using cost basis. Shows the value of closed positions and the cost of open positions. Represents the actual profit/loss from executed trades without mark-to-market volatility.*
+*Realized returns using cost basis. Shows the value of closed positions and the cost of open positions. Represents the actual profit/loss from executed trades without mark-to-market volatility.*
 
 ---
 
@@ -64,11 +64,11 @@ The Pro version leverages cutting-edge reasoning and planning capabilities. It's
 
 ##### Pro Version - Unrealized PnL (Market Price)
 ![Pro Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized_pro.png)
-*Weekly unrealized returns for Pro models using market prices. Advanced reasoning models typically show more consistent performance with better risk management and market timing.*
+*Unrealized returns for Pro models using market prices. Advanced reasoning models typically show more consistent performance with better risk management and market timing.*
 
 ##### Pro Version - Realized PnL (Cost Price)
 ![Pro Realized PnL](experiments/visualizations/pnl_weekly_realized_pro.png)
-*Weekly realized returns for Pro models using cost basis. Demonstrates the effectiveness of advanced models in actual trade execution and position management.*
+*Realized returns for Pro models using cost basis. Demonstrates the effectiveness of advanced models in actual trade execution and position management.*
 
 ---
 
@@ -107,14 +107,14 @@ This chart enables easy assessment of:
 #### 📅 Daily Portfolio Dynamics
 
 ![Model Attention by Date](experiments/visualizations/model_attention_by_date.png)
-*Temporal allocation patterns: How model allocations evolved day-by-day during the 7-day trading period. Each color represents a stock, showing portfolio composition changes in response to market conditions and decision-making processes. Wider bands indicate more concentrated positions.*
+*Temporal allocation patterns: How model allocations evolved day-by-day during the trading period. Each color represents a stock, showing portfolio composition changes in response to market conditions and decision-making processes. Wider bands indicate more concentrated positions.*
 
 ---
 
 #### 💾 ETF Performance Baseline
 
 ![ETF Performance](experiments/visualizations/etf_performance.png)
-*Equal-weight ETF returns over the 7-day period. Provides a buy-and-hold baseline for comparison. A score of 0% represents holding the equal-weight basket unchanged throughout the period, showing the reference return without any active trading.*
+*Equal-weight ETF returns over the trading period. Provides a buy-and-hold baseline for comparison. A score of 0% represents holding the equal-weight basket unchanged throughout the period, showing the reference return without any active trading.*
 
 ---
 
@@ -122,7 +122,7 @@ This chart enables easy assessment of:
 
 Complete performance statistics including:
 - **Daily Returns**: Day-by-day performance breakdown
-- **Cumulative Return**: Total return over the 7-day period
+- **Cumulative Return**: Total return over the trading period
 - **Win Rate**: Percentage of profitable trading days
 - **Maximum Drawdown**: Largest peak-to-trough decline
 - **Volatility**: Standard deviation of returns
