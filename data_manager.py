@@ -277,23 +277,51 @@ class DataManager:
     def get_news(self, start_date: Optional[Any] = None, end_date: Optional[Any] = None,
                  symbols: Optional[List[str]] = None, limit: int = 150) -> pd.DataFrame:
         """
-        检索新闻，仅返回「今天 + 往前2天」窗口内的数据，用于智能体读取历史背景。
+        检索新闻，仅返回「决策时点往前2天的00:00:00 到 决策时点」窗口内的数据，用于智能体读取历史背景。
+        例如：如果决策时点是 2026-01-22 10:00:00，则返回 2026-01-20 00:00:00 到 2026-01-22 10:00:00 的新闻。
         （实时搜索 AKShare 获取的新新闻不受此限制。）
         """
-        LOOKBACK_DAYS = 3  # today + past 2 days
         PRIMARY_LIMIT = 25
 
         if self.news_df is None or self.news_df.empty:
             return pd.DataFrame()
 
-        end_dt = self._ensure_utc(end_date) if end_date else pd.Timestamp.now(tz='UTC')
+        # 处理 end_date：如果它是字符串且没有时区信息，假设它是 Asia/Shanghai 时区，然后转换为 UTC
+        if end_date:
+            if isinstance(end_date, str) and 'T' not in end_date and '+' not in end_date and end_date.count(':') >= 1:
+                # 格式如 "2026-01-22 10:00:00"，假设是 Asia/Shanghai 时区
+                try:
+                    naive_dt = pd.to_datetime(end_date)
+                    # 先本地化为 Asia/Shanghai，再转换为 UTC
+                    end_dt = naive_dt.tz_localize('Asia/Shanghai').tz_convert('UTC')
+                except Exception:
+                    # 如果转换失败，使用 _ensure_utc 作为回退
+                    end_dt = self._ensure_utc(end_date)
+            else:
+                end_dt = self._ensure_utc(end_date)
+        else:
+            end_dt = pd.Timestamp.now(tz='UTC')
+        
         if end_dt is None:
             self.logger.error(f"无效的 end_date '{end_date}'。操作中止。")
             return pd.DataFrame()
 
         try:
-            start_dt = end_dt - timedelta(days=LOOKBACK_DAYS)
-            self.logger.info(f"新闻窗口: 仅搜索最近 {LOOKBACK_DAYS} 天（含今天）的新闻 (上限 {PRIMARY_LIMIT} 条)...")
+            # 计算开始时间：决策时点往前推2天的00:00:00（Asia/Shanghai 时区的00:00:00）
+            # 例如：如果 end_dt 是 2026-01-22 02:00:00 UTC（对应 2026-01-22 10:00:00 Asia/Shanghai），
+            # 则 start_dt 应该是 2026-01-20 00:00:00 Asia/Shanghai（即 2026-01-19 16:00:00 UTC）
+            # 为了简化，我们使用 end_dt 的日期部分（在 Asia/Shanghai 时区）来计算
+            end_dt_shanghai = end_dt.tz_convert('Asia/Shanghai')
+            end_date_only = end_dt_shanghai.date()
+            start_date_only = end_date_only - timedelta(days=2)
+            # 将开始日期转换为当天的00:00:00（Asia/Shanghai 时区），然后转换为 UTC
+            start_dt_shanghai = pd.Timestamp.combine(start_date_only, datetime.min.time()).tz_localize('Asia/Shanghai')
+            start_dt = start_dt_shanghai.tz_convert('UTC')
+            
+            # 日志输出使用 Asia/Shanghai 时区，更易读
+            start_dt_display = start_dt.tz_convert('Asia/Shanghai')
+            end_dt_display = end_dt.tz_convert('Asia/Shanghai')
+            self.logger.info(f"新闻窗口: 从 {start_dt_display.strftime('%Y-%m-%d %H:%M:%S')} 到 {end_dt_display.strftime('%Y-%m-%d %H:%M:%S')} (Asia/Shanghai, 上限 {PRIMARY_LIMIT} 条)...")
 
             date_mask = (self.news_df['created_at'] >= start_dt) & (self.news_df['created_at'] <= end_dt)
             filtered_df = self.news_df[date_mask].copy()
@@ -317,10 +345,13 @@ class DataManager:
             filtered_df.sort_values(by='created_at', ascending=False, inplace=True)
             primary_result_df = filtered_df.head(min(PRIMARY_LIMIT, limit))
 
+            # 日志输出使用 Asia/Shanghai 时区，更易读
+            start_dt_display = start_dt.tz_convert('Asia/Shanghai')
+            end_dt_display = end_dt.tz_convert('Asia/Shanghai')
             if primary_result_df.empty:
-                self.logger.info("最近三天内没有可用的历史新闻，将返回空结果。")
+                self.logger.info(f"在时间窗口 [{start_dt_display.strftime('%Y-%m-%d %H:%M:%S')}, {end_dt_display.strftime('%Y-%m-%d %H:%M:%S')}] (Asia/Shanghai) 内没有可用的历史新闻，将返回空结果。")
             else:
-                self.logger.info(f"找到 {len(primary_result_df)} 条新闻（限制在三天窗口内）。")
+                self.logger.info(f"找到 {len(primary_result_df)} 条新闻（限制在时间窗口 [{start_dt_display.strftime('%Y-%m-%d %H:%M:%S')}, {end_dt_display.strftime('%Y-%m-%d %H:%M:%S')}] (Asia/Shanghai) 内）。")
             return primary_result_df
 
         except Exception as e:

@@ -180,7 +180,7 @@ class AgenticWorkflow:
                 self.openai_base_url = (
                     os.getenv("QWEN_API_BASE")
                     or os.getenv("DASHSCOPE_API_BASE")
-                    or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                    or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
                 )
             else:
                 self.openai_base_url = os.getenv("OPENAI_API_BASE")
@@ -293,9 +293,20 @@ class AgenticWorkflow:
 
     def _prefetch_all_news(self, today_date: str, current_time: str, max_retries: int = 2) -> None:
         print("📰 Prefetching news for all whitelisted symbols...")
-        # 观察窗口：当天 + 过去 2 天（共 3 天）。并且只取 <= current_time 的新闻，避免“看见未来”。
-        cutoff = pd.to_datetime(today_date) - pd.Timedelta(days=2)
+        # 观察窗口：决策时点往前推2天的00:00:00 到 决策时点。
+        # 例如：如果决策时点是 2026-01-22 10:00:00，则筛选 2026-01-20 00:00:00 到 2026-01-22 10:00:00 的新闻。
         now_dt = pd.to_datetime(current_time, errors="coerce")
+        if now_dt is not None:
+            # 确保 now_dt 是 naive datetime（Asia/Shanghai 时区，但去掉时区信息）
+            if now_dt.tzinfo is not None:
+                now_dt = now_dt.tz_convert("Asia/Shanghai").tz_localize(None)
+            # 计算开始时间：决策时点往前推2天的00:00:00
+            start_date_only = (now_dt - pd.Timedelta(days=2)).date()
+            cutoff = pd.Timestamp.combine(start_date_only, datetime.min.time())
+        else:
+            # 如果无法解析 current_time，回退到旧逻辑
+            cutoff = pd.to_datetime(today_date) - pd.Timedelta(days=2)
+            now_dt = pd.to_datetime(current_time, errors="coerce")
         for sym in self.stock_symbols:
             normalized = normalize_symbol(sym)
             if not normalized:
@@ -1539,7 +1550,8 @@ class AgenticWorkflow:
         historical_news = []
         if self.dm and self.dm.news_df is not None:
             try:
-                news_df = self.dm.get_news(end_date=today_date, symbols=[symbol_for_query], limit=20)
+                # 传递完整的决策时点（包含时间），用于新闻截断
+                news_df = self.dm.get_news(end_date=search_time, symbols=[symbol_for_query], limit=20)
                 news_df = self._filter_allowed_news_df(news_df)
                 if news_df is not None and not news_df.empty:
                     # 将所有列转为字符串，避免 Timestamp 序列化问题
@@ -2154,7 +2166,7 @@ class AgenticWorkflow:
                 print(f"ℹ️  Using Gemini 3 model: thought_signature is required for function calls and should be automatically handled by LangChain.")
         elif self.basemodel.startswith("qwen"):
             print(f"🤖 Initializing Qwen model: {self.basemodel}")
-            dashscope_url = self.openai_base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            dashscope_url = self.openai_base_url or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
             # Process parameters for Qwen (enable_thinking, temperature, max_tokens, etc.)
             extra_body = {}
             model_kwargs = {}
