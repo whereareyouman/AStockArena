@@ -30,27 +30,6 @@ This section showcases comprehensive performance comparisons across Lite and Pro
 
 AStock Arena supports two configurable model portfolios to optimize for different use cases:
 
-#### 🟢 **Lite Version** - Cost-Optimized Models
-
-The Lite version emphasizes cost-effectiveness while maintaining solid decision-making quality. It's ideal for frequent backtesting, parameter tuning, and large-scale experiments. All 5 Lite models run in parallel with identical market data, allowing fair performance comparison at lower API costs.
-
-**Models**: 
-- Claude Haiku 4.5
-- DeepSeek Chat
-- GPT-5.1
-- Qwen3-235b
-- Gemini 2.5 Flash
-
-##### Lite Version - Unrealized PnL (Market Price)
-![Lite Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized_lite.png)
-*Unrealized returns using market prices at decision time. Shows real-time performance as if positions were liquidated at current market rates. Trading period with 3 decision points daily (10:30, 11:30, 14:00 Beijing time).*
-
-##### Lite Version - Realized PnL (Cost Price)
-![Lite Realized PnL](experiments/visualizations/pnl_weekly_realized_lite.png)
-*Realized returns using cost basis. Shows the value of closed positions and the cost of open positions. Represents the actual profit/loss from executed trades without mark-to-market volatility.*
-
----
-
 #### 🔵 **Pro Version** - Advanced Models
 
 The Pro version leverages cutting-edge reasoning and planning capabilities. It's recommended for production trading and serious research requiring maximum decision quality. These advanced models demonstrate superior strategic planning in complex market scenarios.
@@ -62,13 +41,43 @@ The Pro version leverages cutting-edge reasoning and planning capabilities. It's
 - Qwen3-Max
 - Gemini 3 Pro Preview
 
+#### 🟢 **Lite Version** - Cost-Optimized Models
+
+The Lite version emphasizes cost-effectiveness while maintaining solid decision-making quality. It's ideal for frequent backtesting, parameter tuning, and large-scale experiments. All 5 Lite models run in parallel with identical market data, allowing fair performance comparison at lower API costs.
+
+**Models**: 
+- Claude Haiku 4.5
+- DeepSeek Chat
+- GPT-5.1
+- Qwen3-235b
+- Gemini 2.5 Flash
+
+---
+
+#### 📈 **Unrealized PnL Analysis (Market Price)**
+
+Returns calculated using current market prices, highlighting unrealized gains/losses. This metric shows real-time performance as if positions were liquidated at current market rates, emphasizing floating profit/loss dynamics.
+
 ##### Pro Version - Unrealized PnL (Market Price)
 ![Pro Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized_pro.png)
 *Unrealized returns for Pro models using market prices. Advanced reasoning models typically show more consistent performance with better risk management and market timing.*
 
+##### Lite Version - Unrealized PnL (Market Price)
+![Lite Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized_lite.png)
+*Unrealized returns using market prices at decision time. Shows real-time performance as if positions were liquidated at current market rates. Trading period with 3 decision points daily (10:30, 11:30, 14:00 Beijing time).*
+
+---
+#### 💰 **Realized PnL Analysis (Cost Price)**
+
+Returns calculated using entry cost basis, measuring realized gains that are already secured. This metric represents the actual profit/loss from executed trades, showing the value of closed positions and the cost basis of open positions, without mark-to-market volatility.
+
 ##### Pro Version - Realized PnL (Cost Price)
 ![Pro Realized PnL](experiments/visualizations/pnl_weekly_realized_pro.png)
 *Realized returns for Pro models using cost basis. Demonstrates the effectiveness of advanced models in actual trade execution and position management.*
+
+##### Lite Version - Realized PnL (Cost Price)
+![Lite Realized PnL](experiments/visualizations/pnl_weekly_realized_lite.png)
+*Realized returns using cost basis. Shows the value of closed positions and the cost of open positions. Represents the actual profit/loss from executed trades without mark-to-market volatility.*
 
 ---
 
@@ -101,20 +110,15 @@ This chart enables easy assessment of:
 
 #### 🎯 Stock Selection Analysis
 
-![Stock Attention Heatmap](experiments/visualizations/stock_attention.png)
+![Stock Attention Heatmap_lite](experiments/visualizations/stock_attention_lite.png)
+![Stock Attention Heatmap_lite](experiments/visualizations/stock_attention_pro.png)
 *Stock selection patterns: Shows which stocks were most frequently held across all models during the trading period. Darker colors indicate higher model consensus and more frequent selection, revealing market preferences and perceived value opportunities.*
 
 #### 📅 Daily Portfolio Dynamics
 
-![Model Attention by Date](experiments/visualizations/model_attention_by_date.png)
+![Model Attention by Date_lite](experiments/visualizations/model_attention_by_date_lite.png)
+![Model Attention by Date_pro](experiments/visualizations/model_attention_by_date_pro.png)
 *Temporal allocation patterns: How model allocations evolved day-by-day during the trading period. Each color represents a stock, showing portfolio composition changes in response to market conditions and decision-making processes. Wider bands indicate more concentrated positions.*
-
----
-
-#### 💾 ETF Performance Baseline
-
-![ETF Performance](experiments/visualizations/etf_performance.png)
-*Equal-weight ETF returns over the trading period. Provides a buy-and-hold baseline for comparison. A score of 0% represents holding the equal-weight basket unchanged throughout the period, showing the reference return without any active trading.*
 
 ---
 
@@ -176,7 +180,9 @@ Total visualizations: **11 PNG/MD files** ready for analysis and presentation
 
 **AStock Arena** is a comprehensive research platform for evaluating and comparing Large Language Models (LLMs) in the context of autonomous intraday trading on China's A-share STAR Market. The system features:
 
-- **Multi-Agent Framework**: Simultaneous evaluation of multiple LLM-driven trading agents (Claude Opus 4.5, GPT-5.2, DeepSeek Reasoner, Gemini 3 Pro Preview, Qwen3-Max)
+- **Multi-Agent Framework**: Simultaneous evaluation of multiple LLM-driven trading agents with dual model versions:
+  - **Lite Version**: Claude Haiku 4.5, DeepSeek Chat, GPT-5.1, Qwen3-235b, Gemini 2.5 Flash
+  - **Pro Version**: Claude Opus 4.5, DeepSeek Reasoner, GPT-5.2, Qwen3-Max, Gemini 3 Pro Preview
 - **Shared Market Snapshots**: Centralized data fetching mechanism to ensure fair comparison and reduce API costs
 - **Process-Isolated Execution**: Each agent runs in an isolated subprocess with independent runtime environments
 - **Real-Time Visualization**: Interactive Vite-based dashboard for monitoring agent decisions, positions, and performance
@@ -187,7 +193,9 @@ The platform enables researchers to systematically study LLM decision-making cap
 ## ✨ Key Features
 
 ### 🤖 Agent Support
-- **Pre-configured Models**: Claude Opus 4.5, GPT-5.2, DeepSeek Reasoner, Gemini 3 Pro Preview, Qwen3-Max
+- **Dual Model Versions**: System supports both **Lite** (cost-optimized) and **Pro** (advanced) model portfolios
+  - **Lite Models**: Claude Haiku 4.5, DeepSeek Chat, GPT-5.1, Qwen3-235b, Gemini 2.5 Flash
+  - **Pro Models**: Claude Opus 4.5, DeepSeek Reasoner, GPT-5.2, Qwen3-Max, Gemini 3 Pro Preview
 - **Extensible Architecture**: Easy integration of new LLM models
 - **Independent Runtime Environments**: Each model can have custom configurations
 
@@ -220,7 +228,7 @@ The platform enables researchers to systematically study LLM decision-making cap
 
 ### Multi-Agent System Framework
 
-The system follows an **observation-action cycle** architecture where each AI agent independently observes market conditions and makes trading decisions. All 5 agents (GPT-5.2, Claude Opus 4.5, DeepSeek Reasoner, Gemini 3 Pro Preview, and Qwen3-Max) operate in parallel with shared market snapshots to ensure fair comparison.
+The system follows an **observation-action cycle** architecture where each AI agent independently observes market conditions and makes trading decisions. The system supports dual model versions: **Lite** (Claude Haiku 4.5, DeepSeek Chat, GPT-5.1, Qwen3-235b, Gemini 2.5 Flash) and **Pro** (Claude Opus 4.5, DeepSeek Reasoner, GPT-5.2, Qwen3-Max, Gemini 3 Pro Preview). All 5 agents within each version operate in parallel with shared market snapshots to ensure fair comparison.
 
 **Workflow Overview:**
 
@@ -377,7 +385,7 @@ AStockArena/
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/AStockArena.git
+git clone https://github.com/whereareyouman/AStockArena.git
 cd AStockArena
 
 # Create virtual environment
@@ -514,6 +522,7 @@ Comprehensive documentation is available in the [documentation/](documentation) 
 
 - **Market**: China A-Share STAR Market
 - **Ticker Whitelist**: 10 selected stocks (SH688008, 688111, 688009, 688981, 688256, 688271, 688047, 688617, 688303, 688180)
+- **Extended Testing**: STAR 50 Index component testing in progress (expanded test pool with 50 trading instruments), stay tuned!
 - **Decision Windows**: 10:30, 11:30, 14:00 (avoiding opening volatility)
 - **Position Limits**: 50% maximum per ticker
 - **Settlement**: T+1 (realistic Chinese market rules)
@@ -548,65 +557,15 @@ To validate AI's performance capabilities in the high-volatility STAR Market (Ch
 
 ### Evaluated Models
 
-| Model | Provider |
-|-------|----------|
-| Claude Opus 4.5 | Anthropic |
-| GPT-5.2 | OpenAI |
-| DeepSeek Reasoner | DeepSeek |
-| Gemini 3 Pro Preview | Google |
-| Qwen3-Max | Alibaba |
+The system evaluates models in two versions: **Lite** (cost-optimized) and **Pro** (advanced). Each model family has both versions for performance comparison.
 
-### Experimental Results
-
-We are conducting an ongoing trading experiment from January 12 to February 13, 2026 (until Chinese New Year holiday closure) comparing five state-of-the-art LLM models in live market conditions. Each model makes independent trading decisions at three decision windows daily (10:30, 11:30, 14:00).
-
-**Note**: The results shown below represent the **first 5 days** (January 12-16, 2026) of testing. This is not a 5-day experiment - the testing period extends through February 16, 2026, and results will be updated daily during trading days.
-
-#### Weekly Performance Comparison
-
-##### Realized PnL (Cost Price)
-
-![Weekly Realized PnL](experiments/visualizations/pnl_weekly_realized.png)
-*Weekly realized PnL comparison based on cost price. Equity is calculated as cash plus position cost basis (shares × avg_price), which does not fluctuate with market prices.*
-
-##### Unrealized PnL (Market Price)
-
-![Weekly Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized.png)
-*Weekly unrealized PnL comparison based on market price. Equity is calculated as cash plus position market value (shares × current market price), which fluctuates with market prices.*
-
-**Key Findings:**
-- All models demonstrated distinct trading strategies and risk profiles
-- Models showed varying levels of conservatism in position sizing
-- Performance divergence increased over the trading week
-- Decision quality varied significantly across different market conditions
-- Realized PnL (based on cost price) shows stable equity that doesn't fluctuate with market prices
-- Unrealized PnL (based on market price) reflects floating gains/losses that change with market movements
-
-#### Stock Attention Analysis
-
-![Stock Attention](experiments/visualizations/stock_attention.png)
-*Stacked area chart showing how many models held each stock over time. Height represents the number of models (0-5) holding a particular stock at each decision point.*
-
-**Observations:**
-- LLMs exhibited conservative behavior, typically holding 1-2 stocks simultaneously
-- Stock preferences shifted dynamically based on market conditions and news
-- Certain stocks attracted consistent cross-model attention
-- Concentration patterns reveal consensus opportunities and divergent strategies
-
-#### Model Trading Behavior by Date
-
-![Model Attention by Date](experiments/visualizations/model_attention_by_date.png)
-*Daily comparison of the average number of stocks held by each model, showing trading aggressiveness and portfolio diversification strategies.*
-
-**Behavioral Insights:**
-- Models displayed consistent personality traits (conservative vs. aggressive)
-- Some models maintained stable position counts while others adapted dynamically
-- Portfolio diversity varied from concentrated (1-2 stocks) to diversified (4-5 stocks)
-- Trading activity patterns suggest different risk tolerance levels
-
-#### Performance Metrics Summary
-
-For detailed performance statistics, see [experiments/visualizations/performance_summary.md](experiments/visualizations/performance_summary.md).
+| Model Family | Lite Version | Pro Version | Provider |
+|--------------|--------------|-------------|----------|
+| Claude | Claude Haiku 4.5 | Claude Opus 4.5 | Anthropic |
+| GPT | GPT-5.1 | GPT-5.2 | OpenAI |
+| DeepSeek | DeepSeek Chat | DeepSeek Reasoner | DeepSeek |
+| Gemini | Gemini 2.5 Flash | Gemini 3 Pro Preview | Google |
+| Qwen | Qwen3-235b | Qwen3-Max | Alibaba |
 
 ## 🤝 Contributing
 
@@ -636,7 +595,7 @@ If you use AStock Arena in your research, please cite:
   author = {Liu, Zeyu and Lai, Sing Kwong and Fang, Zihao and Ge, Yiqing and Zhang, Jitong and Kim, Jinwan},
   year = {2026},
   organization = {HKUST PEIlab},
-  url = {https://github.com/your-org/AStockArena}
+  url = {https://github.com/whereareyouman/AStockArena}
 }
 ```
 
