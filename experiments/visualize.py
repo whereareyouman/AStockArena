@@ -25,7 +25,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Date range filter (inclusive)
 DATE_FILTER_START = datetime.strptime("2026-01-12 00:00:00", "%Y-%m-%d %H:%M:%S")
-DATE_FILTER_END = datetime.strptime("2026-01-21 23:59:59", "%Y-%m-%d %H:%M:%S")
+DATE_FILTER_END = datetime.strptime("2026-01-22 23:59:59", "%Y-%m-%d %H:%M:%S")
 
 
 def in_date_range(dt: datetime) -> bool:
@@ -538,11 +538,15 @@ def extract_model_attention_by_date(model_dict: Dict = None) -> Dict[str, Dict[s
     return model_attention
 
 
-def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]], output_filename: str = "model_attention_by_date.png", title_prefix: str = "Model Stock Attention by Date"):
+def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]], output_filename: str = "model_attention_by_date.png", title_prefix: str = "Model Stock Attention by Date", models_config: Dict = None):
     """绘制每个模型在不同日期的关注度（持有股票数）"""
     if not model_attention:
         print("⚠ No model attention data available")
         return
+    
+    # 如果没有指定 models_config，使用全局 MODELS
+    if models_config is None:
+        models_config = MODELS
     
     # 获取所有日期
     all_dates = set()
@@ -574,8 +578,8 @@ def plot_model_attention_by_date(model_attention: Dict[str, Dict[str, int]], out
     for idx, model_sig in enumerate(model_sigs):
         stocks_count = [model_attention.get(model_sig, {}).get(date, 0) 
                         for date in all_dates]
-        label = MODELS.get(model_sig, {}).get("label", model_sig)
-        color = MODELS.get(model_sig, {}).get("color", "#666666")
+        label = models_config.get(model_sig, {}).get("label", model_sig)
+        color = models_config.get(model_sig, {}).get("color", "#666666")
         
         ax.bar(x + idx * width, stocks_count,
                width=width,
@@ -1707,10 +1711,10 @@ def main():
     
     print("📊 Generating model attention by date charts (Lite, Pro)...")
     model_attention_lite = extract_model_attention_by_date(MODELS_LITE)
-    plot_model_attention_by_date(model_attention_lite, "model_attention_by_date_lite.png", "Model Stock Attention by Date (Lite)")
+    plot_model_attention_by_date(model_attention_lite, "model_attention_by_date_lite.png", "Model Stock Attention by Date (Lite)", models_config=MODELS_LITE)
 
     model_attention_pro = extract_model_attention_by_date(MODELS_PRO)
-    plot_model_attention_by_date(model_attention_pro, "model_attention_by_date_pro.png", "Model Stock Attention by Date (Pro)")
+    plot_model_attention_by_date(model_attention_pro, "model_attention_by_date_pro.png", "Model Stock Attention by Date (Pro)", models_config=MODELS_PRO)
     
     # 4.5 生成模型版本对比图
     print("📈 Generating Model Version Comparison chart (Lite vs Pro)...")
