@@ -163,6 +163,8 @@ This creates 11 comprehensive outputs:
 
 Total visualizations: **11 PNG/MD files** ready for analysis and presentation
 
+**Generate Star50 Benchmark Data**: Run `star50_benchmark.py` to compute the passive buy-and-hold benchmark that tracks the STAR 50 Index. This script automatically optimizes initial capital to minimize cash drag and generates `nav_history.json` used by the visualization scripts.
+
 ---
 
 ## 📋 Table of Contents
@@ -368,6 +370,7 @@ AStockArena/
 ├── 📄 main.py                  # Main entry point
 ├── 📄 api_server.py            # FastAPI backend
 ├── 📄 data_manager.py          # Data access layer
+├── 📄 star50_benchmark.py      # STAR 50 index passive tracking benchmark
 ├── 📄 requirements.txt        # Python dependencies
 ├── 📄 LICENSE                  # MIT License
 └── 📄 README.md               # This file
