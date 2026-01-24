@@ -25,7 +25,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Date range filter (inclusive)
 DATE_FILTER_START = datetime.strptime("2026-01-12 00:00:00", "%Y-%m-%d %H:%M:%S")
-DATE_FILTER_END = datetime.strptime("2026-01-22 23:59:59", "%Y-%m-%d %H:%M:%S")
+DATE_FILTER_END = datetime.strptime("2026-01-23 23:59:59", "%Y-%m-%d %H:%M:%S")
 
 
 def in_date_range(dt: datetime) -> bool:
