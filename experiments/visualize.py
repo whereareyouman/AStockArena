@@ -12,6 +12,24 @@ from typing import Dict, List, Tuple
 import numpy as np
 from scipy.interpolate import make_interp_spline
 import pandas as pd
+import os
+
+# 加载 .env 文件（如果存在）
+try:
+    from dotenv import load_dotenv
+    # 尝试从项目根目录加载 .env 文件
+    env_path = Path(__file__).parent.parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+        print(f"✓ Loaded .env file from {env_path}")
+    else:
+        # 如果项目根目录没有，尝试从当前目录加载
+        load_dotenv()
+except ImportError:
+    # 如果没有安装 python-dotenv，跳过
+    pass
+except Exception as e:
+    print(f"⚠️ Warning: Failed to load .env file: {e}")
 
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
@@ -952,67 +970,6 @@ def calculate_etf_price_series() -> List[Tuple[datetime, float]]:
     return etf_series
 
 
-def fetch_kechuang50_index_series() -> List[Tuple[datetime, float]]:
-    """
-    获取科创50指数数据（使用akshare）
-    指数代码: sh000688
-    返回: [(timestamp, close_price), ...]
-    """
-    try:
-        import akshare as ak
-        import pandas as pd
-        
-        print(f"📡 Fetching 科创50 index data from akshare (sh000688)...")
-        
-        # Fetch daily data from akshare
-        df = ak.stock_zh_index_daily(symbol='sh000688')
-        
-        # Convert date column to datetime
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # Filter to configured date range
-        df_filtered = df[(df['date'] >= DATE_FILTER_START) & (df['date'] <= DATE_FILTER_END)]
-
-        if df_filtered.empty:
-            print(f"⚠️ Warning: No 科创50 index data found for date range {DATE_FILTER_START.date()} to {DATE_FILTER_END.date()}")
-            return []
-        
-        # Generate data points for each decision time on each day
-        # For daily data, we'll use the close price and replicate it for each decision time
-        # This is reasonable since we're comparing daily performance
-        decision_times = ["10:30:00", "11:30:00", "14:00:00"]
-        
-        index_series = []
-        for _, row in df_filtered.iterrows():
-            date_obj = row['date']
-            close_price = float(row['close'])
-            
-            # Create entries for each decision time on this day
-            for time_str in decision_times:
-                # Parse time and combine with date
-                time_parts = time_str.split(':')
-                dt = date_obj.replace(
-                    hour=int(time_parts[0]),
-                    minute=int(time_parts[1]),
-                    second=int(time_parts[2])
-                )
-                index_series.append((dt, close_price))
-        
-        # Sort by datetime
-        index_series = sorted(index_series, key=lambda x: x[0])
-        
-        if index_series:
-            print(f"✓ 科创50 index series: {len(index_series)} data points from {index_series[0][0]} to {index_series[-1][0]}")
-        
-        return index_series
-        
-    except Exception as e:
-        print(f"⚠️ Warning: Failed to fetch 科创50 index data from akshare: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
-
-
 def calculate_etf_return_series(etf_series: List[Tuple[datetime, float]]) -> Dict[str, List[Tuple[datetime, float]]]:
     """
     计算ETF的收益率序列
@@ -1143,49 +1100,87 @@ def plot_etf_performance(etf_data: Dict):
     plt.close()
 
 
-def calculate_kechuang50_return_series(kc50_series: List[Tuple[datetime, float]]) -> Dict[str, List[Tuple[datetime, float]]]:
+def fetch_star50_benchmark_series() -> List[Tuple[datetime, float]]:
     """
-    计算科创50指数的收益率序列
-    以 2026-01-12 第一个价格作为基准价格（初始价格）
-    返回: {
-        'index': [(datetime, index_price), ...],
-        'return_pct': [(datetime, return_pct), ...]
-    }
+    从 nav_history.json 读取 Star50 benchmark 数据
+    返回: [(datetime, return_pct), ...]
     """
-    if not kc50_series:
-        return {}
+    nav_history_path = PROJECT_ROOT / "data_flow" / "star50_benchmark" / "nav_history.json"
     
-    # 按时间排序
-    kc50_series = sorted(kc50_series, key=lambda x: x[0])
+    if not nav_history_path.exists():
+        print(f"⚠️ Warning: nav_history.json not found at {nav_history_path}")
+        return []
     
-    # 计算收益率（相对 2026-01-12 的第一个价格作为初始价格）
-    initial_price = kc50_series[0][1]
-    
-    if initial_price <= 0:
-        print(f"⚠️ Warning: Invalid initial price {initial_price}")
-        return {}
-    
-    return_pct_series = []
-    
-    for dt, price in kc50_series:
-        if price > 0:
-            # 收益率 = (当前价格 - 初始价格) / 初始价格 * 100
-            return_pct = ((price - initial_price) / initial_price) * 100
-        else:
-            return_pct = 0
-        return_pct_series.append((dt, return_pct))
-    
-    print(f"✓ 科创50 return series: initial_price={initial_price:.2f}, final_price={kc50_series[-1][1]:.2f}, final_return={return_pct_series[-1][1]:.2f}%")
-    
-    return {
-        'index': kc50_series,
-        'return_pct': return_pct_series
-    }
+    try:
+        with open(nav_history_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        nav_history = data.get('nav_history', [])
+        if not nav_history:
+            print("⚠️ Warning: nav_history is empty")
+            return []
+        
+        # 决策时点（每天3个时间点）
+        decision_times = ["10:30:00", "11:30:00", "14:00:00"]
+        
+        star50_series = []
+        current_date = None
+        time_index_in_day = 0
+        
+        for entry in nav_history:
+            date_str = entry.get('date', '')
+            pnl_pct = entry.get('pnl_pct', 0.0)
+            
+            if not date_str:
+                continue
+            
+            try:
+                # 解析日期 (格式: "20260112")
+                date_obj = datetime.strptime(date_str, "%Y%m%d")
+                
+                # 如果是新的一天，重置时间索引
+                if current_date != date_str:
+                    current_date = date_str
+                    time_index_in_day = 0
+                
+                # 根据当天的时间索引确定具体时间
+                if time_index_in_day < len(decision_times):
+                    time_str = decision_times[time_index_in_day]
+                    time_parts = time_str.split(':')
+                    dt = date_obj.replace(
+                        hour=int(time_parts[0]),
+                        minute=int(time_parts[1]),
+                        second=int(time_parts[2])
+                    )
+                    
+                    # 检查日期是否在范围内
+                    if in_date_range(dt):
+                        star50_series.append((dt, float(pnl_pct)))
+                    
+                    time_index_in_day += 1
+                    
+            except (ValueError, KeyError) as e:
+                print(f"⚠️ Warning: Failed to parse entry {entry}: {e}")
+                continue
+        
+        # 按时间排序
+        star50_series = sorted(star50_series, key=lambda x: x[0])
+        
+        if star50_series:
+            print(f"✓ Star50 benchmark series: {len(star50_series)} data points from {star50_series[0][0]} to {star50_series[-1][0]}")
+        
+        return star50_series
+        
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to read nav_history.json: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 
-def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, kc50_data: Dict = None):
+def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, star50_series: List[Tuple[datetime, float]] = None):
     """
-    对比ETF、科创50指数与各模型的表现（使用样条曲线，每天3个决策点）
+    对比ETF、Star50 benchmark与各模型的表现（使用样条曲线，每天3个决策点）
     使用 Unrealized PnL（市场价格）来展现模型的实际投资收益，包含买入时机效果
     """
     if not etf_data or not unrealized_pnl_data:
@@ -1206,11 +1201,9 @@ def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, kc50_data: Dic
         for dt, _, _ in pnl_list:
             all_times.add(dt)
     
-    # Add 科创50 times if available
-    kc50_return_series = []
-    if kc50_data and 'return_pct' in kc50_data:
-        kc50_return_series = sorted(kc50_data.get('return_pct', []), key=lambda x: x[0])
-        for dt, _ in kc50_return_series:
+    # Add Star50 benchmark times if available
+    if star50_series:
+        for dt, _ in star50_series:
             all_times.add(dt)
     
     sorted_times = sorted(all_times)
@@ -1219,27 +1212,27 @@ def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, kc50_data: Dic
     # 创建图表
     fig, ax = plt.subplots(figsize=(14, 8))
     
-    # 科创50指数数据处理（如果有的话）
-    if kc50_return_series:
-        kc50_x_indices = [time_to_index[dt] for dt, _ in kc50_return_series if dt in time_to_index]
-        kc50_returns = [ret for dt, ret in kc50_return_series if dt in time_to_index]
+    # Star50 benchmark 数据处理（如果有的话）
+    if star50_series:
+        star50_x_indices = [time_to_index[dt] for dt, _ in star50_series if dt in time_to_index]
+        star50_returns = [ret for dt, ret in star50_series if dt in time_to_index]
         
-        if kc50_x_indices:
-            kc50_x_indices = np.array(kc50_x_indices)
-            kc50_returns = np.array(kc50_returns)
+        if star50_x_indices:
+            star50_x_indices = np.array(star50_x_indices)
+            star50_returns = np.array(star50_returns)
             
-            # 绘制科创50（使用样条曲线，橙色系）
-            if len(kc50_x_indices) > 3:
-                x_smooth = np.linspace(kc50_x_indices.min(), kc50_x_indices.max(), 300)
-                spl = make_interp_spline(kc50_x_indices, kc50_returns, k=3)
+            # 绘制Star50 benchmark（使用样条曲线，紫色系）
+            if len(star50_x_indices) > 3:
+                x_smooth = np.linspace(star50_x_indices.min(), star50_x_indices.max(), 300)
+                spl = make_interp_spline(star50_x_indices, star50_returns, k=3)
                 returns_smooth = spl(x_smooth)
-                ax.plot(x_smooth, returns_smooth, linewidth=3.5, color='#FF6B35', 
-                        label='STAR 50 Index (SSE 688)', zorder=5, linestyle='--')
+                ax.plot(x_smooth, returns_smooth, linewidth=3.5, color='#9B59B6', 
+                        label='Star50 benchmark', zorder=5, linestyle='-.')
             else:
-                ax.plot(kc50_x_indices, kc50_returns, 'o-', linewidth=3, color='#FF6B35',
-                        label='STAR 50 Index (SSE 688)', markersize=5, zorder=5, linestyle='--')
+                ax.plot(star50_x_indices, star50_returns, 'o-', linewidth=3, color='#9B59B6',
+                        label='Star50 benchmark', markersize=5, zorder=5, linestyle='-.')
             
-            ax.scatter(kc50_x_indices, kc50_returns, color='#FF6B35', s=50, alpha=0.7, zorder=6)
+            ax.scatter(star50_x_indices, star50_returns, color='#9B59B6', s=50, alpha=0.7, zorder=6)
     
     # ETF数据处理（保留所有决策时点）
     etf_x_indices = [time_to_index[dt] for dt, _ in return_series]
@@ -1323,11 +1316,11 @@ def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, kc50_data: Dic
     plt.close()
 
 
-def plot_benchmarks_comparison(etf_data: Dict, lite_pnl_data: Dict, pro_pnl_data: Dict, kc50_data: Dict = None):
+def plot_benchmarks_comparison(etf_data: Dict, lite_pnl_data: Dict, pro_pnl_data: Dict, star50_series: List[Tuple[datetime, float]] = None):
     """
     生成Lite和Pro两个版本的benchmark对比图
-    左图：Lite模型 vs ETF vs 科创50
-    右图：Pro模型 vs ETF vs 科创50
+    左图：Lite模型 vs ETF vs Star50 benchmark
+    右图：Pro模型 vs ETF vs Star50 benchmark
     """
     if not etf_data:
         print("⚠️ Warning: Missing ETF data for benchmark comparison")
@@ -1342,18 +1335,13 @@ def plot_benchmarks_comparison(etf_data: Dict, lite_pnl_data: Dict, pro_pnl_data
     # 创建双图表
     fig, axes = plt.subplots(1, 2, figsize=(18, 7))
     
-    # 科创50数据处理
-    kc50_return_series = []
-    if kc50_data and 'return_pct' in kc50_data:
-        kc50_return_series = sorted(kc50_data.get('return_pct', []), key=lambda x: x[0])
-    
     # 绘制Lite版本
     ax = axes[0]
-    _plot_benchmark_single(ax, return_series, lite_pnl_data, kc50_return_series, "Lite Version", MODELS_LITE)
+    _plot_benchmark_single(ax, return_series, lite_pnl_data, "Lite Version", MODELS_LITE, star50_series)
     
     # 绘制Pro版本
     ax = axes[1]
-    _plot_benchmark_single(ax, return_series, pro_pnl_data, kc50_return_series, "Pro Version", MODELS_PRO)
+    _plot_benchmark_single(ax, return_series, pro_pnl_data, "Pro Version", MODELS_PRO, star50_series)
     
     plt.tight_layout()
     output_file = OUTPUT_DIR / "benchmarks_lite_vs_pro.png"
@@ -1362,11 +1350,11 @@ def plot_benchmarks_comparison(etf_data: Dict, lite_pnl_data: Dict, pro_pnl_data
     plt.close()
 
 
-def plot_benchmarks_realized(etf_data: Dict, lite_realized: Dict, pro_realized: Dict, kc50_data: Dict = None):
+def plot_benchmarks_realized(etf_data: Dict, lite_realized: Dict, pro_realized: Dict, star50_series: List[Tuple[datetime, float]] = None):
     """
     生成 Lite 和 Pro 版本的基准对比图（使用 Realized PnL）
-    左图：Lite realized vs ETF vs 科创50
-    右图：Pro realized vs ETF vs 科创50
+    左图：Lite realized vs ETF vs Star50 benchmark
+    右图：Pro realized vs ETF vs Star50 benchmark
     """
     if not etf_data:
         print("⚠️ Warning: Missing ETF data for realized benchmark comparison")
@@ -1380,15 +1368,11 @@ def plot_benchmarks_realized(etf_data: Dict, lite_realized: Dict, pro_realized: 
 
     fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 
-    kc50_return_series = []
-    if kc50_data and 'return_pct' in kc50_data:
-        kc50_return_series = sorted(kc50_data.get('return_pct', []), key=lambda x: x[0])
-
     ax = axes[0]
-    _plot_benchmark_single(ax, return_series, lite_realized, kc50_return_series, "Lite Version (Realized)", MODELS_LITE)
+    _plot_benchmark_single(ax, return_series, lite_realized, "Lite Version (Realized)", MODELS_LITE, star50_series)
 
     ax = axes[1]
-    _plot_benchmark_single(ax, return_series, pro_realized, kc50_return_series, "Pro Version (Realized)", MODELS_PRO)
+    _plot_benchmark_single(ax, return_series, pro_realized, "Pro Version (Realized)", MODELS_PRO, star50_series)
 
     plt.tight_layout()
     output_file = OUTPUT_DIR / "benchmarks_lite_vs_pro_realized.png"
@@ -1397,7 +1381,7 @@ def plot_benchmarks_realized(etf_data: Dict, lite_realized: Dict, pro_realized: 
     plt.close()
 
 
-def _plot_benchmark_single(ax, etf_series, model_pnl_data, kc50_series, title_suffix, model_dict):
+def _plot_benchmark_single(ax, etf_series, model_pnl_data, title_suffix, model_dict, star50_series=None):
     """
     绘制单个benchmark对比图（Lite或Pro）
     """
@@ -1408,29 +1392,33 @@ def _plot_benchmark_single(ax, etf_series, model_pnl_data, kc50_series, title_su
     for pnl_list in model_pnl_data.values():
         for dt, _, _ in pnl_list:
             all_times.add(dt)
-    for dt, _ in kc50_series:
-        all_times.add(dt)
+    if star50_series:
+        for dt, _ in star50_series:
+            all_times.add(dt)
     
     sorted_times = sorted(all_times)
     time_to_index = {dt: idx for idx, dt in enumerate(sorted_times)}
     
-    # 绘制科创50
-    if kc50_series:
-        kc50_x_indices = [time_to_index[dt] for dt, _ in kc50_series if dt in time_to_index]
-        kc50_returns = [ret for dt, ret in kc50_series if dt in time_to_index]
+    # 绘制Star50 benchmark
+    if star50_series:
+        star50_x_indices = [time_to_index[dt] for dt, _ in star50_series if dt in time_to_index]
+        star50_returns = [ret for dt, ret in star50_series if dt in time_to_index]
         
-        if kc50_x_indices:
-            kc50_x_indices = np.array(kc50_x_indices)
-            kc50_returns = np.array(kc50_returns)
+        if star50_x_indices:
+            star50_x_indices = np.array(star50_x_indices)
+            star50_returns = np.array(star50_returns)
             
-            if len(kc50_x_indices) > 3:
-                x_smooth = np.linspace(kc50_x_indices.min(), kc50_x_indices.max(), 300)
-                spl = make_interp_spline(kc50_x_indices, kc50_returns, k=3)
+            if len(star50_x_indices) > 3:
+                x_smooth = np.linspace(star50_x_indices.min(), star50_x_indices.max(), 300)
+                spl = make_interp_spline(star50_x_indices, star50_returns, k=3)
                 returns_smooth = spl(x_smooth)
-                ax.plot(x_smooth, returns_smooth, linewidth=3.5, color='#FF6B35', 
-                        label='STAR 50 Index (SSE 688)', zorder=5, linestyle='--')
+                ax.plot(x_smooth, returns_smooth, linewidth=3.5, color='#9B59B6', 
+                        label='Star50 benchmark', zorder=5, linestyle='-.')
+            else:
+                ax.plot(star50_x_indices, star50_returns, 'o-', linewidth=3, color='#9B59B6',
+                        label='Star50 benchmark', markersize=5, zorder=5, linestyle='-.')
             
-            ax.scatter(kc50_x_indices, kc50_returns, color='#FF6B35', s=50, alpha=0.7, zorder=6)
+            ax.scatter(star50_x_indices, star50_returns, color='#9B59B6', s=50, alpha=0.7, zorder=6)
     
     # 绘制ETF
     etf_x_indices = [time_to_index[dt] for dt, _ in etf_series]
@@ -1662,15 +1650,11 @@ def main():
         etf_data = {}
         print("⚠ Warning: Failed to calculate ETF")
     
-    # 3.5 获取科创50指数数据
-    print("📊 Fetching 科创50 Index (SSE 688) data...")
-    kc50_series = fetch_kechuang50_index_series()
-    if kc50_series:
-        print(f"✓ 科创50 index series: {len(kc50_series)} data points")
-        kc50_data = calculate_kechuang50_return_series(kc50_series)
-    else:
-        kc50_data = {}
-        print("⚠ Warning: Failed to fetch 科创50 index data")
+    # 3.5 获取Star50 benchmark数据
+    print("📊 Fetching Star50 benchmark data...")
+    star50_series = fetch_star50_benchmark_series()
+    if not star50_series:
+        print("⚠ Warning: Failed to fetch Star50 benchmark data")
     
     # 4. 生成PnL对比图（4张：Lite Unrealized、Lite Realized、Pro Unrealized、Pro Realized）
     print("\n📈 Generating Weekly PnL Charts (4 charts total):")
@@ -1696,8 +1680,8 @@ def main():
         print("📈 Generating ETF performance chart...")
         plot_etf_performance(etf_data)
         
-        print("📈 Generating ETF vs Models comparison chart (with 科创50)...")
-        plot_etf_vs_models(etf_data, unrealized_pnl_data, kc50_data)
+        print("📈 Generating ETF vs Models comparison chart (with Star50 benchmark)...")
+        plot_etf_vs_models(etf_data, unrealized_pnl_data, star50_series)
     
     print("📊 Generating stock attention charts (overall, Lite, Pro)...")
     attention_data_all = extract_stock_attention()
@@ -1724,16 +1708,16 @@ def main():
         print("⚠ Warning: Insufficient data for model version comparison")
     
     # 4.6 生成Lite和Pro的benchmark对比图
-    print("📈 Generating Benchmarks Comparison chart (Lite & Pro vs ETF & 科创50)...")
+    print("📈 Generating Benchmarks Comparison chart (Lite & Pro vs ETF & Star50 benchmark)...")
     if etf_data and lite_unrealized_pnl and pro_unrealized_pnl:
-        plot_benchmarks_comparison(etf_data, lite_unrealized_pnl, pro_unrealized_pnl, kc50_data)
+        plot_benchmarks_comparison(etf_data, lite_unrealized_pnl, pro_unrealized_pnl, star50_series)
     else:
         print("⚠ Warning: Insufficient data for benchmarks comparison")
 
     # 4.7 生成Lite和Pro的Realized benchmark对比图
-    print("📈 Generating Realized Benchmarks Comparison chart (Lite & Pro vs ETF & 科创50)...")
+    print("📈 Generating Realized Benchmarks Comparison chart (Lite & Pro vs ETF & Star50 benchmark)...")
     if etf_data and lite_realized_pnl and pro_realized_pnl:
-        plot_benchmarks_realized(etf_data, lite_realized_pnl, pro_realized_pnl, kc50_data)
+        plot_benchmarks_realized(etf_data, lite_realized_pnl, pro_realized_pnl, star50_series)
     else:
         print("⚠ Warning: Insufficient data for realized benchmarks comparison")
     

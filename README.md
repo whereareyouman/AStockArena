@@ -101,7 +101,9 @@ The system compares AI-driven trading performance against established market ben
 Side-by-side comparison of Lite and Pro model versions against market benchmarks. This dual-panel visualization clearly shows performance differences between cost-optimized and advanced models:
 
 ![Benchmarks Lite vs Pro Comparison](experiments/visualizations/benchmarks_lite_vs_pro.png)
-*Left panel: 5 Lite models (Haiku, Chat, GPT-5.1, Qwen3-235b, Gemini 2.5 Flash) vs ETF and 科创50. Right panel: 5 Pro models (Opus, Reasoner, GPT-5.2, Qwen3-Max, Gemini 3-Pro) vs same benchmarks. Direct visual comparison of model version upgrade effects on benchmark performance.*
+*Left panel: 5 Lite models (Haiku, Chat, GPT-5.1, Qwen3-235b, Gemini 2.5 Flash) vs ETF and Star50 benchmark. Right panel: 5 Pro models (Opus, Reasoner, GPT-5.2, Qwen3-Max, Gemini 3-Pro) vs same benchmarks. Direct visual comparison of model version upgrade effects on benchmark performance.*
+
+**Star50 Benchmark**: A passive buy-and-hold strategy that tracks the STAR 50 Index (科创50, 000688.SH) by purchasing index constituent stocks at their initial weights on the first trading day (10:30 AM) and holding them without rebalancing. This benchmark provides a baseline for comparing active AI trading strategies against a passive index-tracking approach, using intraday price data from TinySoft for accurate performance measurement.
 
 This chart enables easy assessment of:
 - Whether Lite models can compete with passive benchmarks
@@ -152,7 +154,7 @@ MODEL_VERSION=pro python3 experiments/visualize.py
 This creates 11 comprehensive outputs:
 - **4 PnL comparison charts**: Lite unrealized, Lite realized, Pro unrealized, Pro realized
 - **2 Benchmark comparison charts**: 
-  - All models vs ETF & 科创50
+  - All models vs ETF & Star50 benchmark
   - Lite & Pro side-by-side vs benchmarks (NEW)
 - **1 ETF performance baseline**
 - **1 Model version comparison**: Lite vs Pro upgrade effects
