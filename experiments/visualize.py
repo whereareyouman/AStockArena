@@ -770,8 +770,8 @@ def plot_weekly_pnl(pnl_data: Dict[str, List[Tuple[datetime, float, float]]],
         x_indices = np.array(unique_indices)
         returns = np.array(unique_returns)
         
-        # 获取模型配置信息
-        model_info = model_dict.get(model_sig, model_dict.get(model_sig, MODELS.get(model_sig, {"color": "#999999", "label": model_sig})))
+        # 获取模型配置信息（优先使用传入的 model_dict，然后尝试 MODELS_LITE 和 MODELS_PRO）
+        model_info = model_dict.get(model_sig) or MODELS_LITE.get(model_sig) or MODELS_PRO.get(model_sig) or {"color": "#999999", "label": model_sig}
         
         # 使用样条插值创建平滑曲线
         if len(x_indices) > 3:  # 样条插值至少需要4个点
@@ -1178,7 +1178,7 @@ def fetch_star50_benchmark_series() -> List[Tuple[datetime, float]]:
         return []
 
 
-def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, star50_series: List[Tuple[datetime, float]] = None):
+def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, star50_series: List[Tuple[datetime, float]] = None, model_dict: Dict = None):
     """
     对比ETF、Star50 benchmark与各模型的表现（使用样条曲线，每天3个决策点）
     使用 Unrealized PnL（市场价格）来展现模型的实际投资收益，包含买入时机效果
@@ -1186,6 +1186,9 @@ def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, star50_series:
     if not etf_data or not unrealized_pnl_data:
         print("⚠️ Warning: Missing data for comparison chart")
         return
+    
+    if model_dict is None:
+        model_dict = MODELS
     
     return_series = etf_data.get('return_pct', [])
     if not return_series:
@@ -1277,7 +1280,8 @@ def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, star50_series:
         model_x_indices = np.array(model_x_indices)
         model_returns = np.array(model_returns)
         
-        model_info = MODELS.get(model_sig, {})
+        # 尝试从 MODELS_LITE 和 MODELS_PRO 中查找模型信息
+        model_info = model_dict.get(model_sig) or MODELS_LITE.get(model_sig) or MODELS_PRO.get(model_sig) or {}
         label = model_info.get('label', model_sig)
         color = model_info.get('color', '#000000')
         
@@ -1681,7 +1685,10 @@ def main():
         plot_etf_performance(etf_data)
         
         print("📈 Generating ETF vs Models comparison chart (with Star50 benchmark)...")
-        plot_etf_vs_models(etf_data, unrealized_pnl_data, star50_series)
+        # 合并 lite 和 pro 的 unrealized 数据以显示所有模型
+        all_unrealized_pnl = {**lite_unrealized_pnl, **pro_unrealized_pnl}
+        all_models_dict = {**MODELS_LITE, **MODELS_PRO}
+        plot_etf_vs_models(etf_data, all_unrealized_pnl, star50_series, all_models_dict)
     
     print("📊 Generating stock attention charts (overall, Lite, Pro)...")
     attention_data_all = extract_stock_attention()
