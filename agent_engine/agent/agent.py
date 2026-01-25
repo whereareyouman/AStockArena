@@ -312,7 +312,7 @@ class AgenticWorkflow:
             if not normalized:
                 continue
             raw_query = f"{strip_exchange_prefix(normalized) or normalized} 最新消息"
-            result_str = self.search_stock_news(raw_query, max_retries=max_retries)
+            result_str = self.search_stock_news(raw_query, max_retries=max_retries, current_time=current_time)
             try:
                 payload = json.loads(result_str)
             except Exception:
@@ -1491,7 +1491,7 @@ class AgenticWorkflow:
         except Exception as e:
             return json.dumps({"error": f"买入股票时出错: {str(e)}"})
     
-    def search_stock_news(self, query: str, max_retries: int = 3) -> str:
+    def search_stock_news(self, query: str, max_retries: int = 3, current_time: Optional[str] = None) -> str:
         """
         搜索股票相关的实时新闻 + 读取历史新闻，使用 AKShare，失败重试。
         同时会从 DataManager 读取历史新闻，并将新闻保存到 news.csv
@@ -1536,7 +1536,8 @@ class AgenticWorkflow:
             return json.dumps(cached_news, ensure_ascii=False)
 
         today_date = get_runtime_config_value("TODAY_DATE")
-        current_time = get_runtime_config_value("CURRENT_TIME")
+        runtime_current_time = get_runtime_config_value("CURRENT_TIME")
+        current_time = current_time or runtime_current_time
         if current_time:
             search_time = current_time
         elif today_date:
