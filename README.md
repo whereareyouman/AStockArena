@@ -59,11 +59,11 @@ The Lite version emphasizes cost-effectiveness while maintaining solid decision-
 Returns calculated using current market prices, highlighting unrealized gains/losses. This metric shows real-time performance as if positions were liquidated at current market rates, emphasizing floating profit/loss dynamics.
 
 ##### Pro Version - Unrealized PnL (Market Price)
-![Pro Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized_pro.png)
+![Pro Unrealized PnL](experiments/visualizations/benchmarks_unrealized_pro.png)
 *Unrealized returns for Pro models using market prices. Advanced reasoning models typically show more consistent performance with better risk management and market timing.*
 
 ##### Lite Version - Unrealized PnL (Market Price)
-![Lite Unrealized PnL](experiments/visualizations/pnl_weekly_unrealized_lite.png)
+![Lite Unrealized PnL](experiments/visualizations/benchmarks_unrealized_lite.png)
 *Unrealized returns using market prices at decision time. Shows real-time performance as if positions were liquidated at current market rates. Trading period with 3 decision points daily (10:30, 11:30, 14:00 Beijing time).*
 
 ---
@@ -72,20 +72,21 @@ Returns calculated using current market prices, highlighting unrealized gains/lo
 Returns calculated using entry cost basis, measuring realized gains that are already secured. This metric represents the actual profit/loss from executed trades, showing the value of closed positions and the cost basis of open positions, without mark-to-market volatility.
 
 ##### Pro Version - Realized PnL (Cost Price)
-![Pro Realized PnL](experiments/visualizations/pnl_weekly_realized_pro.png)
+![Pro Realized PnL](experiments/visualizations/benchmarks_realized_pro.png)
 *Realized returns for Pro models using cost basis. Demonstrates the effectiveness of advanced models in actual trade execution and position management.*
 
 ##### Lite Version - Realized PnL (Cost Price)
-![Lite Realized PnL](experiments/visualizations/pnl_weekly_realized_lite.png)
+![Lite Realized PnL](experiments/visualizations/benchmarks_realized_lite.png)
 *Realized returns using cost basis. Shows the value of closed positions and the cost of open positions. Represents the actual profit/loss from executed trades without mark-to-market volatility.*
 
 ---
 
 #### 📈 **Model Version Performance Uplift**
 
-The chart below directly compares each Lite model against its corresponding Pro upgrade, highlighting the performance improvement from using more capable LLMs:
+The charts below directly compares each Lite model against its corresponding Pro upgrade, highlighting the performance improvement from using more capable LLMs:
 
-![Model Version Comparison](experiments/visualizations/model_version_comparison.png)
+![Model Version Comparison_unrealized](experiments/visualizations/model_version_comparison_unrealized.png)
+![Model Version Comparison_realized](experiments/visualizations/model_version_comparison_realized.png)
 *5-subplot comparison (Lite vs Pro): Claude Haiku→Opus, DeepSeek Chat→Reasoner, GPT-5.1→5.2, Qwen3-235b→Max, Gemini 2.5→3-Pro. Gray represents Lite performance, colored lines represent Pro performance for each model family.*
 
 ---
@@ -100,7 +101,8 @@ The system compares AI-driven trading performance against established market ben
 
 Side-by-side comparison of Lite and Pro model versions against market benchmarks. This dual-panel visualization clearly shows performance differences between cost-optimized and advanced models:
 
-![Benchmarks Lite vs Pro Comparison](experiments/visualizations/benchmarks_lite_vs_pro.png)
+![Benchmarks Lite vs Pro Comparison_unrealized](experiments/visualizations/benchmarks_unrealized_lite_vs_pro.png)
+![Benchmarks Lite vs Pro Comparison_realized](experiments/visualizations/benchmarks_realized_lite_vs_pro.png)
 *Left panel: 5 Lite models (Haiku, Chat, GPT-5.1, Qwen3-235b, Gemini 2.5 Flash) vs ETF and Star50 benchmark. Right panel: 5 Pro models (Opus, Reasoner, GPT-5.2, Qwen3-Max, Gemini 3-Pro) vs same benchmarks. Direct visual comparison of model version upgrade effects on benchmark performance.*
 
 **Star50 Benchmark**: A passive buy-and-hold strategy that tracks the STAR 50 Index (科创50, 000688.SH) by purchasing index constituent stocks at their initial weights on the first trading day (10:30 AM) and holding them without rebalancing. This benchmark provides a baseline for comparing active AI trading strategies against a passive index-tracking approach, using intraday price data from TinySoft for accurate performance measurement.
