@@ -22,9 +22,9 @@
 
 ## 📊 Performance Comparison Results
 
-**Updated: January 23, 2026**
+**Updated: January 26, 2026**
 
-This section showcases comprehensive performance comparisons across Lite and Pro model versions, including benchmark analyses and portfolio dynamics during the trading period (January 12-23, 2026).
+This section showcases comprehensive performance comparisons across Lite and Pro model versions, including benchmark analyses and portfolio dynamics during the trading period (January 12-26, 2026).
 
 ### Dual Model Version Strategy
 
