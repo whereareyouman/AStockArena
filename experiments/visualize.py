@@ -25,12 +25,26 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Date range filter (inclusive)
 DATE_FILTER_START = datetime.strptime("2026-01-12 00:00:00", "%Y-%m-%d %H:%M:%S")
-DATE_FILTER_END = datetime.strptime("2026-01-27 23:59:59", "%Y-%m-%d %H:%M:%S")
+DATE_FILTER_END = datetime.strptime("2026-01-29 23:59:59", "%Y-%m-%d %H:%M:%S")
 
 
 def in_date_range(dt: datetime) -> bool:
     """Return True if dt is within configured date window (inclusive)."""
     return DATE_FILTER_START <= dt <= DATE_FILTER_END
+
+
+def build_daily_ticks(sorted_times: List[datetime]) -> Tuple[List[int], List[str]]:
+    """Build sparse x-axis ticks: one tick per day (first occurrence)."""
+    tick_positions = []
+    tick_labels = []
+    last_date = None
+    for idx, dt in enumerate(sorted_times):
+        current_date = dt.date()
+        if last_date != current_date:
+            tick_positions.append(idx)
+            tick_labels.append(dt.strftime('%m-%d'))
+            last_date = current_date
+    return tick_positions, tick_labels
 
 # PnL snapshots directory
 PNL_SNAPSHOTS_DIR = PROJECT_ROOT / "data_flow" / "pnl_snapshots"
@@ -669,8 +683,8 @@ def plot_stock_attention(attention_data: Dict[datetime, Dict[str, int]], output_
                 linewidth=0.5)
     
     # 设置x轴标签
-    x_labels = [t.strftime('%m-%d\n%H:%M') for t in times]
-    ax.set_xticks(x_indices)
+    x_positions, x_labels = build_daily_ticks(times)
+    ax.set_xticks(x_positions)
     ax.set_xticklabels(x_labels, rotation=45, ha='right')
     
     # 格式化
@@ -792,8 +806,7 @@ def plot_weekly_pnl(pnl_data: Dict[str, List[Tuple[datetime, float, float]]],
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
     
     # 设置x轴和y轴格式
-    x_positions = list(range(len(sorted_times)))
-    x_labels = [dt.strftime('%m-%d\n%H:%M') for dt in sorted_times]
+    x_positions, x_labels = build_daily_ticks(sorted_times)
     ax.set_xticks(x_positions)
     ax.set_xticklabels(x_labels, rotation=45, ha='right')
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.2f}%'))
@@ -1207,8 +1220,7 @@ def plot_etf_performance(etf_data: Dict):
     ax2.legend(fontsize=10)
     
     # 设置x轴标签（显示日期和时间，和前两个图一样）
-    x_labels = [dt.strftime('%m-%d\n%H:%M') for dt in sorted_times]
-    x_positions = list(range(len(sorted_times)))
+    x_positions, x_labels = build_daily_ticks(sorted_times)
     
     ax1.set_xticks(x_positions)
     ax1.set_xticklabels([])  # 上图不显示标签
@@ -1385,8 +1397,7 @@ def plot_etf_vs_models(etf_data: Dict, unrealized_pnl_data: Dict, kc50_data: Dic
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
     
     # 设置x轴标签（和前两个图一样）
-    x_labels = [dt.strftime('%m-%d\n%H:%M') for dt in sorted_times]
-    x_positions = list(range(len(sorted_times)))
+    x_positions, x_labels = build_daily_ticks(sorted_times)
     ax.set_xticks(x_positions)
     ax.set_xticklabels(x_labels, rotation=45, ha='right')
     ax.set_xlabel('Date & Time', fontsize=12)
@@ -1564,8 +1575,7 @@ def plot_star50_return_only(kc50_data: Dict, output_filename: str = "star50_retu
     ax.legend(fontsize=10, loc='best')
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
 
-    x_labels = [dt.strftime('%m-%d\n%H:%M') for dt in times]
-    x_positions = list(range(len(times)))
+    x_positions, x_labels = build_daily_ticks(times)
     ax.set_xticks(x_positions)
     ax.set_xticklabels(x_labels, rotation=45, ha='right')
     ax.set_xlabel('Date & Time', fontsize=12)
@@ -1673,8 +1683,7 @@ def _plot_benchmark_single(ax, etf_series, model_pnl_data, kc50_series, title_su
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
     
     # 设置x轴标签
-    x_labels = [dt.strftime('%m-%d\n%H:%M') for dt in sorted_times]
-    x_positions = list(range(len(sorted_times)))
+    x_positions, x_labels = build_daily_ticks(sorted_times)
     ax.set_xticks(x_positions)
     ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=9)
     ax.set_xlabel('Date & Time', fontsize=11)
@@ -1779,9 +1788,7 @@ def plot_model_version_comparison(lite_pnl_data: Dict, pro_pnl_data: Dict):
         ax.legend(fontsize=9, loc='best')
     
     # 设置 x 轴标签（仅在最后一个子图显示）
-    x_labels = [dt.strftime('%m-%d\n%H:%M') if i % 3 == 0 else '' 
-                for i, dt in enumerate(sorted_times)]
-    x_positions = list(range(len(sorted_times)))
+    x_positions, x_labels = build_daily_ticks(sorted_times)
     
     for ax in axes:
         ax.set_xticks(x_positions)
@@ -1897,9 +1904,7 @@ def plot_model_version_comparison_realized(lite_pnl_data: Dict, pro_pnl_data: Di
         ax.legend(fontsize=9, loc='best')
 
     # 设置 x 轴标签（仅在最后一个子图显示）
-    x_labels = [dt.strftime('%m-%d\n%H:%M') if i % 3 == 0 else ''
-                for i, dt in enumerate(sorted_times)]
-    x_positions = list(range(len(sorted_times)))
+    x_positions, x_labels = build_daily_ticks(sorted_times)
 
     for ax in axes:
         ax.set_xticks(x_positions)
