@@ -22,9 +22,9 @@
 
 ## 📊 Performance Comparison Results
 
-**Updated: February 10, 2026**
+**Updated: February 13, 2026**
 
-This section showcases comprehensive performance comparisons across Lite and Pro model versions, including benchmark analyses and portfolio dynamics during the trading period (January 12-February 10, 2026).
+This section showcases comprehensive performance comparisons across Lite and Pro model versions, including benchmark analyses and portfolio dynamics during the trading period (January 12-February 13, 2026).
 
 ### Dual Model Version Strategy
 
@@ -140,18 +140,18 @@ Complete performance statistics including:
 
 | Model | Sharpe Ratio (Unrealized) | Realized PnL % | Unrealized PnL % | Max Drawdown % (Unrealized) |
 |------|---------------------------|---------------|-----------------|----------------------------|
-| Claude Haiku 4.5 | -1.7186 | -7.07% | -10.05% | 12.15% |
-| DeepSeek Chat | -1.2102 | -1.20% | -10.97% | 15.02% |
-| GPT-5.1 | 1.2038 | 8.74% | 9.10% | 3.67% |
-| Qwen3-235b | -0.9068 | -7.16% | -6.78% | 10.22% |
-| Gemini 2.5 Flash | -0.4787 | -4.57% | -4.25% | 7.22% |
-| Claude Opus 4.5 | 0.2587 | 0.33% | 1.81% | 5.74% |
-| DeepSeek Reasoner | -1.5997 | -0.22% | -13.95% | 17.21% |
-| GPT-5.2 | 0.2716 | 1.07% | 1.77% | 6.38% |
-| Qwen3-Max | -1.1766 | -8.37% | -8.88% | 12.83% |
-| Gemini 3 Pro Preview | -1.8505 | -10.37% | -9.67% | 11.38% |
-| Equal-Weight ETF (10 Stocks) | -1.7547 | -17.24% | -17.24% | 21.41% |
-| STAR 50 Index (SSE 688) | 0.1247 | 0.69% | 0.69% | 8.25% |
+| Claude Haiku 4.5 | -1.9869 | -6.91% | -11.58% | 12.15% |
+| DeepSeek Chat | -0.9880 | -1.20% | -9.66% | 15.02% |
+| GPT-5.1 | 1.0549 | 8.74% | 7.97% | 3.67% |
+| Qwen3-235b | -1.4115 | -9.74% | -10.56% | 10.86% |
+| Gemini 2.5 Flash | -0.8027 | -4.83% | -6.84% | 7.61% |
+| Claude Opus 4.5 | 0.1037 | 0.91% | 0.52% | 5.74% |
+| DeepSeek Reasoner | -1.5817 | -7.37% | -14.40% | 17.21% |
+| GPT-5.2 | 0.1401 | 0.98% | 0.76% | 6.38% |
+| Qwen3-Max | -1.3241 | -9.97% | -10.08% | 12.83% |
+| Gemini 3 Pro Preview | -1.8010 | -9.91% | -9.82% | 11.38% |
+| Equal-Weight ETF (10 Stocks) | -1.6485 | -16.88% | -16.88% | 21.41% |
+| STAR 50 Index (SSE 688) | 0.1868 | 1.27% | 1.27% | 8.25% |
 
 Full report available in:
 📄 [Performance Summary Report](experiments/visualizations/performance_summary.md)
@@ -541,6 +541,8 @@ Comprehensive documentation is available in the [documentation/](documentation) 
 
 
 ## 🧪 Experiments & Results
+
+**Update (February 13, 2026):** Our experiments have concluded. The results, charts, and reports in this section are final for the completed evaluation period.
 
 ### Trading Configuration
 
