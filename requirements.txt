@@ -20,5 +20,3 @@ numpy>=2.2.6
 matplotlib>=3.9.0
 scipy>=1.16.0
 tenacity>=8.0.0
-sentence-transformers>=2.2.0
-

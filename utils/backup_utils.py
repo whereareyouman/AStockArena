@@ -220,14 +220,32 @@ def save_pnl_snapshot(reason: str) -> bool:
             except Exception:
                 return 0.0
 
-        def _estimate_equity_for_positions(positions: Dict[str, Any], decision_time: str = None, date_str: str = None) -> Tuple[float, float, float, float]:
+        def _position_cost_basis(details: Dict[str, Any]) -> float:
+            lots = details.get("lots")
+            if isinstance(lots, list) and lots:
+                total = 0.0
+                for lot in lots:
+                    if not isinstance(lot, dict):
+                        continue
+                    try:
+                        total += float(lot.get("shares", 0) or 0) * float(lot.get("avg_price", 0) or 0)
+                    except Exception:
+                        continue
+                return total
+            try:
+                return float(details.get("shares", 0) or 0) * float(details.get("avg_price", 0) or 0)
+            except Exception:
+                return 0.0
+
+        def _estimate_equity_for_positions(positions: Dict[str, Any], decision_time: str = None, date_str: str = None) -> Dict[str, float]:
             """
             估算持仓权益。
-            返回: (cash, equity, market_value, profit)
-            根据决策时点获取对应时间的价格，不允许使用 avg_price 作为估算。
+            unrealized_equity: cash + 持仓市值（按决策时点市场价）
+            realized_equity: cash + 持仓成本（只体现已实现盈亏和交易费用）
             """
             cash = float(positions.get("CASH", 0.0))
             market_value = 0.0
+            cost_basis = 0.0
 
             for symbol, details in positions.items():
                 if symbol == "CASH":
@@ -236,6 +254,7 @@ def save_pnl_snapshot(reason: str) -> bool:
                     shares = float(details.get("shares", 0))
                     if shares == 0:
                         continue
+                    cost_basis += _position_cost_basis(details)
                     
                     # 根据决策时点获取对应时间的价格
                     price = _get_price_at_time(symbol, decision_time, date_str)
@@ -250,8 +269,18 @@ def save_pnl_snapshot(reason: str) -> bool:
                         
                     market_value += shares * price
 
-            equity = cash + market_value
-            return cash, equity, market_value, 0.0
+            unrealized_equity = cash + market_value
+            realized_equity = cash + cost_basis
+            return {
+                "cash": cash,
+                "position_cost": cost_basis,
+                "market_value": market_value,
+                "realized_equity": realized_equity,
+                "unrealized_equity": unrealized_equity,
+                "realized_pnl": realized_equity - initial_cash,
+                "unrealized_pnl": unrealized_equity - initial_cash,
+                "open_position_pnl": market_value - cost_basis,
+            }
 
         # --- 主逻辑：为所有模型生成 PnL 快照 ---
         agent_data_root = PROJECT_ROOT / "data_flow" / "trading_summary_each_agent"
@@ -310,16 +339,30 @@ def save_pnl_snapshot(reason: str) -> bool:
                 decision_time = rec.get("decision_time", "")
                 decision_count = rec.get("decision_count", 0)
                 
-                _, equity_val, _, _ = _estimate_equity_for_positions(
+                pnl_metrics = _estimate_equity_for_positions(
                     rec.get("positions", {}) or {}, decision_time, d
                 )
-                ret_pct = (equity_val / initial_cash - 1.0) * 100.0 if initial_cash > 0 else 0.0
+                unrealized_equity = pnl_metrics["unrealized_equity"]
+                realized_equity = pnl_metrics["realized_equity"]
+                unrealized_return_pct = (unrealized_equity / initial_cash - 1.0) * 100.0 if initial_cash > 0 else 0.0
+                realized_return_pct = (realized_equity / initial_cash - 1.0) * 100.0 if initial_cash > 0 else 0.0
                 new_pnl_data.append({
                     "date": d,
                     "decision_time": decision_time,  # 添加决策时点
                     "decision_count": decision_count,  # 添加决策序号
-                    "returnPct": ret_pct,
-                    "equity": equity_val,
+                    # Backward compatible: existing charts treated equity/returnPct as floating market value.
+                    "returnPct": unrealized_return_pct,
+                    "equity": unrealized_equity,
+                    "cash": pnl_metrics["cash"],
+                    "position_cost": pnl_metrics["position_cost"],
+                    "market_value": pnl_metrics["market_value"],
+                    "realized_equity": realized_equity,
+                    "realized_returnPct": realized_return_pct,
+                    "realized_pnl": pnl_metrics["realized_pnl"],
+                    "unrealized_equity": unrealized_equity,
+                    "unrealized_returnPct": unrealized_return_pct,
+                    "unrealized_pnl": pnl_metrics["unrealized_pnl"],
+                    "open_position_pnl": pnl_metrics["open_position_pnl"],
                     "id": rec.get("id"),
                 })
 
@@ -356,7 +399,7 @@ def save_pnl_snapshot(reason: str) -> bool:
                 if d:
                     key = f"{d}_{decision_time}"
                     new_id = item.get("id", -1)
-                    if key not in merged_by_datetime or new_id > merged_by_datetime[key].get("id", -1):
+                    if key not in merged_by_datetime or new_id >= merged_by_datetime[key].get("id", -1):
                         merged_by_datetime[key] = item
             
             # 按日期和时间排序并保存
@@ -381,4 +424,3 @@ def save_pnl_snapshot(reason: str) -> bool:
         except UnicodeEncodeError:
             print(f"WARNING: Error saving PnL snapshot: {e}")
         return False
-

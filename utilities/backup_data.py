@@ -205,7 +205,15 @@ def main() -> int:
             except UnicodeEncodeError:
                 print(f"WARNING: Using alternative backup directory: {target_dir}")
 
-    target_dir.mkdir(parents=True, exist_ok=False)
+    for create_attempt in range(3):
+        try:
+            target_dir.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            suffix = datetime.now(timezone.utc).strftime("%f")
+            target_dir = args.output_dir / f"{timestamp}_{suffix}"
+            if create_attempt == 2:
+                raise
 
     archive_path = _create_archive(target_dir, files)
     _write_manifest(target_dir, archive_path.name, files)

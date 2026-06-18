@@ -20,6 +20,31 @@
 
 ---
 
+## Update: 19 June 2026
+
+This repository is being adjusted toward a benchmark-oriented version of AStock Arena. The main trading flow is still the same: agents observe a shared market snapshot, make decisions at fixed intraday windows, and write paper positions and research logs. The recent changes mainly make this flow easier to replay, audit, and compare.
+
+What changed in this version:
+
+- **Backtest mode**: `BACKTEST_MODE=true` makes decision-time tools read from `news.csv` and shared snapshots instead of fetching fresh market/news data during agent reasoning.
+- **Shared snapshots**: price, indicator, and news data are prepared once per decision window, then reused by all enabled models for a fairer comparison.
+- **Benchmark reports**: outputs include realized and unrealized equity views, action-quality metrics, workflow coverage, and a small Fin-SNR failure taxonomy.
+- **Readable artifacts**: each run keeps complete raw files (`input.json`, `conversation.jsonl`, `decision_report.json`) and a shorter `readable.md` summary.
+- **Live paper scheduler**: `python -m utilities.live_scheduler` can run the same paper-trading loop at configured times, with retries and CSV/JSONL error records. Server-specific launch scripts are intentionally kept out of the public repo.
+
+For a historical benchmark run, configure `settings/default_config.json`, prepare or reuse local news/snapshot data, then run:
+
+```bash
+BACKTEST_MODE=true python main.py
+```
+
+For a paper-live scheduler check:
+
+```bash
+python -m utilities.live_scheduler settings/default_config.json --doctor
+python -m utilities.live_scheduler settings/default_config.json --once --dry-run
+```
+
 ## 📊 Performance Comparison Results
 
 **Updated: February 13, 2026**
@@ -663,5 +688,4 @@ Made with ❤️ by HKUST PEIlab
 [🌐 Website](https://github.com/whereareyouman/AStockArena) • [📧 Contact](mailto:your-email@example.com) • [🐛 Report Bug](https://github.com/whereareyouman/AStockArena/issues) • [💡 Request Feature](https://github.com/whereareyouman/AStockArena/issues)
 
 </div>
-
 

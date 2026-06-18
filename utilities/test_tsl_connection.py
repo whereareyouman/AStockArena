@@ -3,6 +3,8 @@
 import os
 from datetime import datetime, timedelta
 
+__test__ = False
+
 def test_tsl_connection():
     print("=== TinySoft Connection Test ===\n")
     
@@ -88,4 +90,3 @@ def test_tsl_connection():
 if __name__ == "__main__":
     success = test_tsl_connection()
     exit(0 if success else 1)
-

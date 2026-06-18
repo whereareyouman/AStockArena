@@ -148,7 +148,7 @@ def normalize_decision_time(date_str: Optional[str], decision_time: Optional[str
     return f"{date_part} {time_part}"
 
 
-def _normalize_position_entry(data: Any) -> Tuple[int, Optional[str], Optional[float]]:
+def _normalize_position_entry(data: Any) -> Tuple[int, Optional[str], Optional[float], List[Dict[str, Any]]]:
     """
     将 position 条目转换为统一结构，返回 (shares, purchase_date, avg_price)。
     """
@@ -166,13 +166,136 @@ def _normalize_position_entry(data: Any) -> Tuple[int, Optional[str], Optional[f
                 avg_price = float(avg_price_raw)
             except (TypeError, ValueError):
                 avg_price = None
-        return shares, purchase_date, avg_price
+        lots = normalize_lots(data, fallback_shares=shares, fallback_purchase_date=purchase_date, fallback_avg_price=avg_price)
+        return shares, purchase_date, avg_price, lots
 
     try:
         shares = int(float(data))
     except Exception:
         shares = 0
-    return shares, None, None
+    lots = normalize_lots(None, fallback_shares=shares, fallback_purchase_date=None, fallback_avg_price=None)
+    return shares, None, None, lots
+
+
+def normalize_lots(
+    data: Any,
+    fallback_shares: int = 0,
+    fallback_purchase_date: Optional[str] = None,
+    fallback_avg_price: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Normalize lot-level holdings while preserving legacy position entries."""
+    raw_lots = data.get("lots") if isinstance(data, dict) else None
+    normalized: List[Dict[str, Any]] = []
+    if isinstance(raw_lots, list):
+        for lot in raw_lots:
+            if not isinstance(lot, dict):
+                continue
+            try:
+                shares = int(lot.get("shares", 0) or 0)
+            except Exception:
+                shares = 0
+            if shares <= 0:
+                continue
+            purchase_date = lot.get("purchase_date")
+            if purchase_date in (None, "", "null"):
+                purchase_date = fallback_purchase_date
+            else:
+                purchase_date = str(purchase_date)
+            price_raw = lot.get("avg_price", fallback_avg_price)
+            avg_price = None
+            if price_raw is not None:
+                try:
+                    avg_price = float(price_raw)
+                except Exception:
+                    avg_price = fallback_avg_price
+            normalized.append({
+                "shares": shares,
+                "purchase_date": purchase_date,
+                "avg_price": avg_price,
+            })
+
+    if not normalized and fallback_shares > 0:
+        normalized.append({
+            "shares": int(fallback_shares),
+            "purchase_date": fallback_purchase_date,
+            "avg_price": fallback_avg_price,
+        })
+    return normalized
+
+
+def summarize_lots(lots: List[Dict[str, Any]]) -> Tuple[int, Optional[str], Optional[float]]:
+    """Return total shares, earliest purchase date, and weighted average price."""
+    total_shares = 0
+    earliest_date: Optional[str] = None
+    weighted_cost = 0.0
+    priced_shares = 0
+    for lot in lots:
+        try:
+            shares = int(lot.get("shares", 0) or 0)
+        except Exception:
+            shares = 0
+        if shares <= 0:
+            continue
+        total_shares += shares
+        purchase_date = lot.get("purchase_date")
+        if purchase_date:
+            purchase_date = str(purchase_date)
+            earliest_date = purchase_date if earliest_date is None else min(earliest_date, purchase_date)
+        avg_price = lot.get("avg_price")
+        if avg_price is not None:
+            try:
+                weighted_cost += float(avg_price) * shares
+                priced_shares += shares
+            except Exception:
+                pass
+    weighted_avg = (weighted_cost / priced_shares) if priced_shares > 0 else None
+    return total_shares, earliest_date, weighted_avg
+
+
+def get_available_sell_shares(position_entry: Any, today_date: str) -> int:
+    """Return shares eligible for T+1 selling based on lot purchase dates."""
+    shares, purchase_date, avg_price, lots = _normalize_position_entry(position_entry)
+    if shares <= 0:
+        return 0
+    available = 0
+    for lot in lots:
+        lot_date = lot.get("purchase_date")
+        try:
+            lot_shares = int(lot.get("shares", 0) or 0)
+        except Exception:
+            lot_shares = 0
+        if lot_shares <= 0:
+            continue
+        if not lot_date or str(lot_date) < str(today_date):
+            available += lot_shares
+    return available
+
+
+def remove_shares_from_lots(position_entry: Any, amount: int, today_date: str) -> List[Dict[str, Any]]:
+    """Remove shares from sellable lots FIFO-style, preserving same-day locked lots."""
+    _, _, _, lots = _normalize_position_entry(position_entry)
+    remaining_to_sell = int(amount)
+    updated: List[Dict[str, Any]] = []
+    for lot in lots:
+        lot_copy = copy.deepcopy(lot)
+        try:
+            lot_shares = int(lot_copy.get("shares", 0) or 0)
+        except Exception:
+            lot_shares = 0
+        if lot_shares <= 0:
+            continue
+        lot_date = lot_copy.get("purchase_date")
+        sellable = (not lot_date) or str(lot_date) < str(today_date)
+        if sellable and remaining_to_sell > 0:
+            sold = min(lot_shares, remaining_to_sell)
+            lot_shares -= sold
+            remaining_to_sell -= sold
+        if lot_shares > 0:
+            lot_copy["shares"] = lot_shares
+            updated.append(lot_copy)
+    if remaining_to_sell > 0:
+        raise ValueError("可卖持仓数量不足")
+    return updated
 
 
 def normalize_positions(positions: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -203,36 +326,24 @@ def normalize_positions(positions: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             continue
 
         normalized_symbol = normalize_symbol(raw_symbol)
-        shares, purchase_date, avg_price = _normalize_position_entry(data)
+        shares, purchase_date, avg_price, lots = _normalize_position_entry(data)
         if shares <= 0 or normalized_symbol is None:
             continue
 
         existing = accumulator.get(normalized_symbol)
         if existing:
-            existing_shares = existing.get("shares", 0)
-            existing["shares"] = existing_shares + shares
-            if existing.get("purchase_date") is None:
-                existing["purchase_date"] = purchase_date
-            elif purchase_date:
-                existing_date = existing.get("purchase_date")
-                if existing_date is None:
-                    existing["purchase_date"] = purchase_date
-                else:
-                    existing["purchase_date"] = min(existing_date, purchase_date)
-            if avg_price is not None and shares > 0:
-                existing_avg = existing.get("avg_price")
-                if existing_avg is None:
-                    existing["avg_price"] = avg_price
-                else:
-                    total_shares = existing_shares + shares
-                    if total_shares > 0:
-                        weighted = ((existing_avg * existing_shares) + (avg_price * shares)) / total_shares
-                        existing["avg_price"] = weighted
+            existing["lots"].extend(lots)
+            total_shares, earliest_date, weighted_avg = summarize_lots(existing["lots"])
+            existing["shares"] = total_shares
+            existing["purchase_date"] = earliest_date
+            existing["avg_price"] = weighted_avg
         else:
+            total_shares, earliest_date, weighted_avg = summarize_lots(lots)
             accumulator[normalized_symbol] = {
-                "shares": shares,
-                "purchase_date": purchase_date,
-                "avg_price": avg_price,
+                "shares": total_shares,
+                "purchase_date": earliest_date,
+                "avg_price": weighted_avg,
+                "lots": lots,
             }
 
     normalized.update(accumulator)
@@ -252,6 +363,36 @@ def _load_initial_cash() -> float:
     except Exception:
         pass
     return 1000000.0
+
+
+def _load_log_path() -> Path:
+    """Load canonical trading log path from settings/default_config.json."""
+    base_dir = Path(__file__).resolve().parents[1]
+    try:
+        config_file = base_dir / "settings" / "default_config.json"
+        if config_file.exists():
+            with open(config_file, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            raw_path = (cfg or {}).get("log_config", {}).get("log_path", "./data_flow/trading_summary_each_agent")
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = base_dir / path
+            return path
+    except Exception:
+        pass
+    return base_dir / "data_flow" / "trading_summary_each_agent"
+
+
+def get_position_file_path(modelname: str, for_write: bool = False) -> Path:
+    """Return canonical position path, with read-only fallback for old root-level logs."""
+    base_dir = Path(__file__).resolve().parents[1]
+    canonical = _load_log_path() / modelname / "position" / "position.jsonl"
+    if for_write or canonical.exists():
+        return canonical
+    legacy = base_dir / "trading_summary_each_agent" / modelname / "position" / "position.jsonl"
+    if legacy.exists():
+        return legacy
+    return canonical
 
 
 def calculate_previous_trading_date(today_date: str) -> str:
@@ -287,8 +428,7 @@ def get_initial_position_for_date(today_date: str, modelname: str) -> Dict[str, 
     Returns:
         {symbol: {"shares": ..., "purchase_date": ...}} 的字典；若未找到任何记录，则返回初始现金持仓。
     """
-    base_dir = Path(__file__).resolve().parents[1]
-    position_file = base_dir / "data_flow" / "trading_summary_each_agent" / modelname / "position" / "position.jsonl"
+    position_file = get_position_file_path(modelname)
 
     if not position_file.exists():
         print(f"Position file {position_file} does not exist")
@@ -358,8 +498,7 @@ def get_current_position(today_date: str, modelname: str) -> tuple[Dict[str, any
           - max_id: 选中记录的最大 id；若未找到任何记录，则为 -1。
           - latest_record: 最新的完整记录，如果不存在则为 None
     """
-    base_dir = Path(__file__).resolve().parents[1]
-    position_file = base_dir / "data_flow" / "trading_summary_each_agent" / modelname / "position" / "position.jsonl"
+    position_file = get_position_file_path(modelname)
 
     if not position_file.exists():
         # 如果持仓文件不存在，返回初始现金持仓
@@ -424,9 +563,8 @@ def upsert_position_record(modelname: str, record: Dict[str, Any]) -> None:
     在 position.jsonl 中根据 (date + decision_time) 覆盖或追加记录。
     如果 record 已包含 id，则复用；否则分配新的递增 id。
     """
-    base_dir = Path(__file__).resolve().parents[1]
-    position_path = base_dir / "data_flow" / "trading_summary_each_agent" / modelname / "position"
-    position_file = position_path / "position.jsonl"
+    position_file = get_position_file_path(modelname, for_write=True)
+    position_path = position_file.parent
 
     os.makedirs(position_path, exist_ok=True)
 

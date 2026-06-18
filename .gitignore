@@ -42,7 +42,30 @@ backups/
 
 # Logs
 logs/
+jobs/
 *.log
+
+# Generated trading/research artifacts
+data_flow/agent_data/
+data_flow/trading_summary_each_agent/
+data_flow/pnl_snapshots/
+data_flow/benchmark_reports/
+trading_summary_each_agent/
+settings/runtime/runtime_env*.json
+settings/runtime/config_*.json
+settings/runtime/
+settings/live_aliyun_config.json
+BENCHMARK_SESSION_README.md
+requirements-embedding.txt
+
+# Local/server operation scripts
+utilities/shell/check_aliyun_live_status.sh
+utilities/shell/deploy_aliyun_live.sh
+utilities/shell/install_live_systemd.sh
+utilities/shell/start_cpu_monitor.sh
+utilities/shell/start_live_from_date.sh
+utilities/shell/start_live_scheduler.sh
+utilities/shell/stop_astock_processes.sh
 
 # Temporary files
 *.tmp

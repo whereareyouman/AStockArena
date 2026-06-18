@@ -2,7 +2,9 @@
 # 启动主程序的脚本（自动使用虚拟环境）
 
 # 确保在项目根目录
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_ROOT"
 
 echo "🚀 Starting..."
 

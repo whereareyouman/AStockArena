@@ -12,12 +12,25 @@ import threading
 import random
 import shutil
 import subprocess
+import time
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from zoneinfo import ZoneInfo
 import pandas as pd
-import pandas_ta as ta
+try:
+    from pandas.errors import Pandas4Warning
+except ImportError:  # pragma: no cover - older pandas versions
+    Pandas4Warning = FutureWarning
+
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*mode\.copy_on_write.*",
+        category=Pandas4Warning,
+    )
+    import pandas_ta as ta
 from dotenv import load_dotenv
 import threading
 
@@ -32,6 +45,11 @@ sys.path.insert(0, project_root)
 
 load_dotenv()
 
+
+class DecisionEvidenceReportError(RuntimeError):
+    """Raised when a model response is not auditable and should be retried."""
+
+
 from data_manager import DataManager
 from agent_engine.shared_prefetch import SharedPrefetchCoordinator
 from utils.runtime_config import extract_llm_conversation, extract_llm_tool_messages, get_runtime_config_value, write_runtime_config_value
@@ -39,11 +57,14 @@ from utils.json_file_manager import safe_read_json
 from utils.position_manager import (
     add_no_trade_record,
     calculate_previous_trading_date,
+    get_available_sell_shares,
     get_current_position,
     normalize_decision_time,
     normalize_positions,
+    remove_shares_from_lots,
     normalize_symbol,
     strip_exchange_prefix,
+    summarize_lots,
     upsert_position_record,
     get_price_limits,
 )
@@ -187,8 +208,11 @@ class AgenticWorkflow:
         else:
             self.openai_base_url = openai_base_url
 
+        is_openrouter = "openrouter.ai" in (self.openai_base_url or "")
         if openai_api_key is None:
-            if self.basemodel.startswith("qwen"):
+            if is_openrouter:
+                self.openai_api_key = os.getenv("OPENROUTER_API_KEY")
+            elif self.basemodel.startswith("qwen"):
                 self.openai_api_key = (
                     os.getenv("QWEN_API_KEY")
                     or os.getenv("DASHSCOPE_API_KEY")
@@ -292,35 +316,38 @@ class AgenticWorkflow:
         return filtered
 
     def _prefetch_all_news(self, today_date: str, current_time: str, max_retries: int = 2) -> None:
-        print("📰 Prefetching news for all whitelisted symbols...")
-        # 观察窗口：决策时点往前推2天的00:00:00 到 决策时点。
-        # 例如：如果决策时点是 2026-01-22 10:00:00，则筛选 2026-01-20 00:00:00 到 2026-01-22 10:00:00 的新闻。
+        print("📰 Prefetching cached news for all whitelisted symbols...")
+        # 新闻先缓存近 30 天，prompt 仍只展示较短标题列表；后处理可用完整 snapshot 做客观统计。
+        news_cache_days = 30
         now_dt = pd.to_datetime(current_time, errors="coerce")
         if now_dt is not None:
             # 确保 now_dt 是 naive datetime（Asia/Shanghai 时区，但去掉时区信息）
             if now_dt.tzinfo is not None:
                 now_dt = now_dt.tz_convert("Asia/Shanghai").tz_localize(None)
-            # 计算开始时间：决策时点往前推2天的00:00:00
-            start_date_only = (now_dt - pd.Timedelta(days=2)).date()
+            start_date_only = (now_dt - pd.Timedelta(days=news_cache_days - 1)).date()
             cutoff = pd.Timestamp.combine(start_date_only, datetime.min.time())
         else:
             # 如果无法解析 current_time，回退到旧逻辑
-            cutoff = pd.to_datetime(today_date) - pd.Timedelta(days=2)
+            cutoff = pd.to_datetime(today_date) - pd.Timedelta(days=news_cache_days - 1)
             now_dt = pd.to_datetime(current_time, errors="coerce")
         for sym in self.stock_symbols:
             normalized = normalize_symbol(sym)
             if not normalized:
                 continue
             raw_query = f"{strip_exchange_prefix(normalized) or normalized} 最新消息"
-            result_str = self.search_stock_news(raw_query, max_retries=max_retries, current_time=current_time)
-            try:
-                payload = json.loads(result_str)
-            except Exception:
-                continue
-            if not payload.get("success"):
-                continue
+            # Snapshot 构建必须是历史时点可复现的：只读已经下载到 news.csv 的新闻，
+            # 不在每个历史决策点触发 AKShare 实时请求，避免未来新闻污染和重复限流。
+            payload = self._read_news_csv_range(
+                normalized_symbol=normalized,
+                query=raw_query,
+                end_time=current_time,
+                lookback_days=news_cache_days,
+                max_results=20,
+            )
 
-            entries = payload.get("historical_news", []) + payload.get("realtime_news", [])
+            entries = payload.get("news") or []
+            if not entries:
+                entries = payload.get("historical_news", []) + payload.get("realtime_news", [])
             entries = self._filter_allowed_news_records(entries)
             recent_items: List[Dict[str, Any]] = []
             for item in entries:
@@ -339,7 +366,9 @@ class AgenticWorkflow:
                 display_time = publish_dt.strftime("%Y-%m-%d %H:%M") if publish_dt is not None else str(publish_raw)
                 recent_items.append({
                     "title": title[:120],
-                    "publish_time": display_time
+                    "publish_time": display_time,
+                    "source": item.get("source") or item.get("来源") or item.get("media") or item.get("媒体"),
+                    "url": item.get("url") or item.get("link") or item.get("链接"),
                 })
 
             recent_items.sort(key=lambda item: item.get("publish_time", ""), reverse=True)
@@ -352,12 +381,14 @@ class AgenticWorkflow:
 
     def _prefetch_all_prices(self, today_date: str, current_time: str) -> None:
         """
-        预抓取 Observation 窗口（3 天）：
+        预抓取 Observation 窗口：
         - 价格：过去 3 天（含当天）在决策时刻的 close
         - 技术指标：过去 3 天（含当天）在决策时刻的 RSI / MACD(12-26-9)
+        - 小时线：缓存可配置天数，供 get_hourly_stock_data / get_technical_indicators 按需切片
         注意：不计算/不输出 OBV（不同股票量纲差异太大）。
         """
-        print("💹 Prefetching 3-day window: price + RSI + MACD(12-26-9) ...")
+        hourly_cache_days = self._snapshot_hourly_cache_days()
+        print(f"💹 Prefetching {hourly_cache_days}-day hourly cache + 3-day price/indicator summary ...")
         if not self.dm:
             print("⚠️ DataManager unavailable; skip prefetch prices/indicators.")
             return
@@ -367,8 +398,7 @@ class AgenticWorkflow:
         rsi_length = 3
         macd_params = {"fast": 12, "slow": 26, "signal": 9}
 
-        # 为了计算 MACD(12/26/9) 与 RSI，需要更长的历史窗口；这里按“自然小时”向前取 20 天
-        lookback_hours = 24 * 20
+        lookback_hours = 24 * (hourly_cache_days + 5)
 
         # 决策时刻对齐（10:30/11:30/14:00）
         anchor_time = (current_time.split(" ")[1] if " " in current_time else "15:00:00").strip()
@@ -381,6 +411,9 @@ class AgenticWorkflow:
             today_obj = datetime.strptime(today_date, "%Y-%m-%d").date()
         except Exception:
             today_obj = None
+        anchor_dt = pd.to_datetime(current_time, errors="coerce")
+        if anchor_dt is not None and not pd.isna(anchor_dt) and getattr(anchor_dt, "tzinfo", None) is not None:
+            anchor_dt = anchor_dt.tz_convert("Asia/Shanghai").tz_localize(None)
 
         for sym in self.stock_symbols:
             normalized = normalize_symbol(sym)
@@ -476,6 +509,34 @@ class AgenticWorkflow:
                 points.sort(key=lambda item: item.get("date", ""))
                 latest_point = points[-1] if points else None
 
+                # 真实小时线窗口：供回测模式下的 get_hourly_stock_data
+                # 按 agent 请求再切片，避免运行期重新打 TinySoft。
+                hourly_records: List[Dict[str, Any]] = []
+                try:
+                    if anchor_dt is not None and not pd.isna(anchor_dt):
+                        window_start = pd.Timestamp.combine(
+                            (anchor_dt - pd.Timedelta(days=hourly_cache_days - 1)).date(),
+                            datetime.min.time(),
+                        )
+                        hourly_df = df[(df.index >= window_start) & (df.index <= anchor_dt)].copy()
+                    else:
+                        window_start = None
+                        hourly_df = df.tail(12).copy()
+
+                    for ts, row in hourly_df.iterrows():
+                        close_val = _to_num(row.get("close"))
+                        hourly_records.append({
+                            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts),
+                            "open": _to_num(row.get("open")) if row.get("open") is not None else close_val,
+                            "high": _to_num(row.get("high")) if row.get("high") is not None else close_val,
+                            "low": _to_num(row.get("low")) if row.get("low") is not None else close_val,
+                            "close": close_val,
+                            "volume": _to_num(row.get("volume")),
+                        })
+                except Exception:
+                    window_start = None
+                    hourly_records = []
+
                 # --- prices payload（供 LLM & 日志使用） ---
                 change_pct = None
                 if len(points) >= 2:
@@ -498,11 +559,37 @@ class AgenticWorkflow:
                         {"date": p.get("date"), "timestamp": p.get("timestamp"), "close": p.get("close")}
                         for p in points
                     ],
+                    # 真实小时线缓存（已过滤到 current_time）
+                    "hourly_3d": {
+                        "cache_days": hourly_cache_days,
+                        "window_start": window_start.strftime("%Y-%m-%d %H:%M:%S") if isinstance(window_start, datetime) else str(window_start) if window_start is not None else None,
+                        "window_end": current_time,
+                        "candles": hourly_records,
+                    },
                 }
 
                 # --- indicators payload（只提供 RSI/MACD，且窗口=3天；不含 OBV） ---
                 latest_rsi = latest_point.get(f"RSI_{rsi_length}") if latest_point else None
                 latest_macd = latest_point.get("MACD_12_26_9") if latest_point else None
+                latest_close = latest_point.get("close") if latest_point else None
+                sma_5_vs_20_pct = self._calculate_sma_5_vs_20_pct(df, anchor_dt)
+                max_drawdown_5d = self._calculate_max_drawdown_pct(df, today_obj, anchor_dt, window_days=5)
+                previous_session_close = self._previous_session_close_from_hourly_df(df, today_obj)
+                limit_info = get_price_limits(normalized, previous_session_close)
+                microstructure = self._build_microstructure_flags(latest_close, limit_info)
+                price_indicators = {
+                    "momentum": {
+                        f"RSI_{rsi_length}": latest_rsi,
+                        "MACD_12_26_9": latest_macd,
+                    },
+                    "trend": {
+                        "SMA_5_vs_20_pct": sma_5_vs_20_pct,
+                    },
+                    "risk": {
+                        "MAX_DRAWDOWN_5D": max_drawdown_5d,
+                    },
+                    "microstructure": microstructure,
+                }
                 self._prefetched_indicators[normalized] = {
                     "symbol": normalized,
                     "anchor_time": anchor_time,
@@ -513,6 +600,7 @@ class AgenticWorkflow:
                         f"RSI_{rsi_length}": latest_rsi,
                         "MACD_12_26_9": latest_macd,
                     },
+                    "price_indicators": price_indicators,
                     "indicators_3d": [
                         {
                             "date": p.get("date"),
@@ -557,10 +645,8 @@ class AgenticWorkflow:
             indicators = indicator_payload.get("indicators") if isinstance(indicator_payload, dict) else None
             indicator_parts: List[str] = []
             if indicators:
-                if indicators.get("SMA_10") is not None:
-                    indicator_parts.append(f"SMA10 {indicators['SMA_10']:.2f}")
-                if indicators.get("RSI_10") is not None:
-                    indicator_parts.append(f"RSI10 {indicators['RSI_10']:.1f}")
+                if indicators.get("RSI_3") is not None:
+                    indicator_parts.append(f"RSI3 {indicators['RSI_3']:.1f}")
                 macd_val = indicators.get("MACD_12_26_9")
                 if macd_val is not None:
                     indicator_parts.append(f"MACD {macd_val:.2f}")
@@ -595,17 +681,21 @@ class AgenticWorkflow:
         Run all prefetch helpers and return a serializable snapshot bundle
         for shared caching/logging.
         """
-        self._prefetched_news.clear()
-        self._prefetched_prices.clear()
-        self._prefetched_indicators.clear()
-        self._prefetch_all_news(today_date, current_time, max_retries=2)
-        self._prefetch_all_prices(today_date, current_time)
+        self._building_snapshot = True
+        try:
+            self._prefetched_news.clear()
+            self._prefetched_prices.clear()
+            self._prefetched_indicators.clear()
+            self._prefetch_all_news(today_date, current_time, max_retries=2)
+            self._prefetch_all_prices(today_date, current_time)
+        finally:
+            self._building_snapshot = False
         
         # 同步更新 ai_stock_data.json：确保快照中的数据也保存到持久化文件
         # 这样可以避免数据只在快照中存在，而 ai_stock_data.json 中没有的情况
         # 注意：_prefetch_all_prices 通过 get_hourly_stock_data 查询了数据但未保存，
         # 这里通过 save_ts_data 批量保存，确保数据持久化
-        if self.dm:
+        if self.dm and bool(getattr(self, "_persist_stock_data_during_snapshot", False)):
             try:
                 ai_stock_data_path = self.stock_json_path
                 # 更新所有股票的数据（使用较长的回溯天数，确保覆盖所有查询的时间范围）
@@ -639,17 +729,28 @@ class AgenticWorkflow:
             "indicators": copy.deepcopy(self._prefetched_indicators),
             "observation_summary": summary,
             "prefetch_config": {
-                "news_window_days": 3,
+                "news_window_days": 30,
                 "metrics_window_days": 3,
                 "news_uses_title_only": True,
                 "price_window_days": 3,
+                "hourly_cache_days": self._snapshot_hourly_cache_days(),
                 "rsi_length": 3,
                 "macd_params": {"fast": 12, "slow": 26, "signal": 9},
+                "snapshot_price_indicators": ["RSI_3", "MACD_12_26_9", "SMA_5_vs_20_pct", "MAX_DRAWDOWN_5D"],
+                "snapshot_microstructure": ["hit_limit_up", "hit_limit_down", "near_limit_up", "near_limit_down"],
                 "obv_used": False,
             },
         }
         self._last_prefetch_bundle = bundle
         return bundle
+
+    def _snapshot_hourly_cache_days(self) -> int:
+        raw = os.getenv("SNAPSHOT_HOURLY_CACHE_DAYS")
+        try:
+            days = int(raw) if raw is not None and str(raw).strip() != "" else 30
+        except Exception:
+            days = 30
+        return max(3, min(days, 60))
 
     def _apply_prefetch_bundle(self, bundle: Dict[str, Any]) -> str:
         """
@@ -667,6 +768,83 @@ class AgenticWorkflow:
         if not summary:
             summary = self._build_observation_summary()
         return summary
+
+    def _compact_snapshot_for_llm(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build a compact prompt-facing snapshot.
+        Heavy cached data, such as per-symbol hourly candles, stays in memory for tools.
+        """
+        compact: Dict[str, Any] = {
+            "snapshot_id": bundle.get("snapshot_id"),
+            "schema_version": bundle.get("schema_version"),
+            "today_date": bundle.get("today_date"),
+            "decision_time": bundle.get("decision_time"),
+            "decision_count": bundle.get("decision_count"),
+            "symbols": bundle.get("symbols") or [],
+            "normalized_symbols": bundle.get("normalized_symbols") or [],
+            "news": {},
+            "prices": {},
+            "indicators": {},
+            "prefetch_config": bundle.get("prefetch_config") or {},
+            "data_notes": [
+                "This is a compact decision snapshot.",
+                "Full cached 60-minute candles are omitted from this prompt; call get_hourly_stock_data when a specific hourly window is needed.",
+                "Additional indicators can be computed from cached hourly candles via get_technical_indicators.",
+            ],
+        }
+
+        news_payload = bundle.get("news") or {}
+        if isinstance(news_payload, dict):
+            for symbol, payload in news_payload.items():
+                if not isinstance(payload, dict):
+                    continue
+                raw_news = payload.get("news") or []
+                compact["news"][symbol] = {
+                    "count": payload.get("count", len(raw_news) if isinstance(raw_news, list) else 0),
+                    "news": [
+                        {
+                            "title": item.get("title"),
+                            "publish_time": item.get("publish_time"),
+                        }
+                        for item in raw_news[:8]
+                        if isinstance(item, dict)
+                    ],
+                }
+
+        prices_payload = bundle.get("prices") or {}
+        if isinstance(prices_payload, dict):
+            for symbol, payload in prices_payload.items():
+                if not isinstance(payload, dict):
+                    continue
+                hourly_payload = payload.get("hourly_3d") if isinstance(payload.get("hourly_3d"), dict) else {}
+                hourly_count = len(hourly_payload.get("candles") or []) if isinstance(hourly_payload, dict) else 0
+                compact["prices"][symbol] = {
+                    "symbol": payload.get("symbol") or symbol,
+                    "anchor_time": payload.get("anchor_time"),
+                    "window_days": payload.get("window_days"),
+                    "summary": payload.get("summary") or {},
+                    "prices_3d": payload.get("prices_3d") or [],
+                    "hourly_3d_available": bool(hourly_count),
+                    "hourly_3d_candle_count": hourly_count,
+                }
+
+        indicators_payload = bundle.get("indicators") or {}
+        if isinstance(indicators_payload, dict):
+            for symbol, payload in indicators_payload.items():
+                if not isinstance(payload, dict):
+                    continue
+                compact["indicators"][symbol] = {
+                    "symbol": payload.get("symbol") or symbol,
+                    "anchor_time": payload.get("anchor_time"),
+                    "window_days": payload.get("window_days"),
+                    "rsi_length": payload.get("rsi_length"),
+                    "macd_params": payload.get("macd_params"),
+                    "indicators": payload.get("indicators") or {},
+                    "price_indicators": payload.get("price_indicators") or {},
+                    "indicators_3d": payload.get("indicators_3d") or [],
+                }
+
+        return compact
 
     def _purge_news_csv(self, csv_path: Optional[str]) -> None:
         if not csv_path or not os.path.exists(csv_path):
@@ -703,6 +881,15 @@ class AgenticWorkflow:
         Returns:
             str: JSON 字符串格式的字典,映射股票代码到价格(如果未找到则为 null)。
         """
+        if self._prefetched_prices:
+            snapshot_prices: Dict[str, Optional[float]] = {}
+            for symbol in symbols:
+                normalized = normalize_symbol(symbol) or symbol
+                snapshot_prices[normalized] = self._get_snapshot_price(normalized)
+            if self._strict_snapshot_mode() or any(v is not None for v in snapshot_prices.values()):
+                return json.dumps(snapshot_prices, ensure_ascii=False)
+        if self._strict_snapshot_mode():
+            return json.dumps({"error": "回测模式：未找到 snapshot 中的价格数据（不访问实时行情源）"}, ensure_ascii=False)
         if not self.dm:
             return json.dumps({"error": "DataManager 未初始化"})
         try:
@@ -710,6 +897,278 @@ class AgenticWorkflow:
             return json.dumps(prices_dict)
         except Exception as e:
             return json.dumps({"error": f"获取当前价格时出错: {str(e)}"})
+
+    def _get_snapshot_hourly_candles(
+        self,
+        normalized_symbol: str,
+        end_time: str,
+        lookback_hours: int,
+    ) -> List[Dict[str, Any]]:
+        price_payload = self._prefetched_prices.get(normalized_symbol) if self._prefetched_prices else None
+        if not isinstance(price_payload, dict):
+            return []
+        hourly_payload = price_payload.get("hourly_3d")
+        if not isinstance(hourly_payload, dict):
+            return []
+        raw_candles = hourly_payload.get("candles")
+        if not isinstance(raw_candles, list):
+            return []
+
+        try:
+            end_dt = pd.to_datetime(end_time, errors="coerce")
+            if end_dt is None or pd.isna(end_dt):
+                end_dt = pd.to_datetime(self._get_context_value("CURRENT_TIME"), errors="coerce")
+            if end_dt is not None and getattr(end_dt, "tzinfo", None) is not None:
+                end_dt = end_dt.tz_convert("Asia/Shanghai").tz_localize(None)
+        except Exception:
+            end_dt = None
+
+        start_dt = None
+        if end_dt is not None and not pd.isna(end_dt):
+            try:
+                start_dt = end_dt - pd.Timedelta(hours=int(lookback_hours or 24))
+            except Exception:
+                start_dt = None
+
+        filtered: List[Dict[str, Any]] = []
+        for candle in raw_candles:
+            if not isinstance(candle, dict):
+                continue
+            ts_raw = candle.get("timestamp")
+            ts = pd.to_datetime(ts_raw, errors="coerce")
+            if ts is not None and not pd.isna(ts) and getattr(ts, "tzinfo", None) is not None:
+                ts = ts.tz_convert("Asia/Shanghai").tz_localize(None)
+            if end_dt is not None and not pd.isna(end_dt) and ts is not None and not pd.isna(ts) and ts > end_dt:
+                continue
+            if start_dt is not None and ts is not None and not pd.isna(ts) and ts < start_dt:
+                continue
+            filtered.append(copy.deepcopy(candle))
+        return filtered
+
+    def _build_hourly_tool_payload(
+        self,
+        symbol: str,
+        normalized_symbol: str,
+        lookback_hours: int,
+        candles: List[Dict[str, Any]],
+        source: str,
+    ) -> Dict[str, Any]:
+        def _to_float(value: Any) -> Optional[float]:
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        latest = candles[-1] if candles else {}
+        latest_close = _to_float(latest.get("close"))
+        prev_close = None
+        if len(candles) > 1:
+            prev_close = _to_float(candles[-2].get("close"))
+        recent_closes = [_to_float(item.get("close")) for item in candles[-self.RECENT_CLOSE_COUNT:]]
+        summary: Dict[str, Any] = {
+            "timestamp": latest.get("timestamp"),
+            "open": _to_float(latest.get("open", latest_close)),
+            "high": _to_float(latest.get("high", latest_close)),
+            "low": _to_float(latest.get("low", latest_close)),
+            "close": latest_close,
+            "volume": _to_float(latest.get("volume")),
+            "previous_close": prev_close,
+            "recent_closes": recent_closes,
+        }
+        if prev_close is not None and latest_close is not None and prev_close != 0:
+            summary["change"] = round(latest_close - prev_close, 4)
+            summary["change_pct"] = round(((latest_close - prev_close) / prev_close) * 100, 4)
+        return {
+            "source": source,
+            "symbol": normalized_symbol or symbol,
+            "lookback_hours": lookback_hours,
+            "requested_lookback_hours": lookback_hours,
+            "granularity": "60min",
+            "bar_interval": "60min",
+            "total_candles_available": len(candles),
+            "candles_returned": len(candles),
+            "summary": summary,
+            "candles": candles,
+        }
+
+    def _calculate_indicators_from_snapshot_candles(
+        self,
+        normalized_symbol: str,
+        end_date: str,
+        lookback_days: int,
+        requested_indicators: Optional[List[str]] = None,
+        candles_override: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        candles = candles_override or self._get_snapshot_hourly_candles(
+            normalized_symbol,
+            end_date,
+            max(int(lookback_days or 3) * 24, 24),
+        )
+        if not candles:
+            return None
+
+        df = pd.DataFrame(candles)
+        if df.empty or "close" not in df.columns or "timestamp" not in df.columns:
+            return None
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+        for col in ("open", "high", "low", "close", "volume"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if df.empty or df["close"].dropna().empty:
+            return None
+
+        requested = requested_indicators or ["RSI_3", "MACD_12_26_9"]
+        normalized_requested = [str(item).strip().upper() for item in requested if str(item).strip()]
+        output_keys: List[str] = []
+        unsupported: List[str] = []
+
+        def _length_from_name(name: str, default: int) -> int:
+            parts = name.split("_")
+            for part in reversed(parts):
+                try:
+                    return max(int(float(part)), 1)
+                except Exception:
+                    continue
+            return default
+
+        def _numbers_from_name(name: str) -> List[int]:
+            nums: List[int] = []
+            for part in name.replace("-", "_").split("_"):
+                try:
+                    nums.append(max(int(float(part)), 1))
+                except Exception:
+                    continue
+            return nums
+
+        for name in normalized_requested:
+            try:
+                if name.startswith("RSI"):
+                    length = _length_from_name(name, 3)
+                    df.ta.rsi(length=length, append=True)
+                    output_keys.append(f"RSI_{length}")
+                elif name.startswith("SMA"):
+                    length = _length_from_name(name, 10)
+                    df.ta.sma(length=length, append=True)
+                    output_keys.append(f"SMA_{length}")
+                elif name.startswith("EMA"):
+                    length = _length_from_name(name, 10)
+                    df.ta.ema(length=length, append=True)
+                    output_keys.append(f"EMA_{length}")
+                elif name.startswith("MACD"):
+                    nums = _numbers_from_name(name)
+                    fast = nums[0] if len(nums) >= 1 else 12
+                    slow = nums[1] if len(nums) >= 2 else 26
+                    signal = nums[2] if len(nums) >= 3 else 9
+                    df.ta.macd(fast=fast, slow=slow, signal=signal, append=True)
+                    output_keys.extend([f"MACD_{fast}_{slow}_{signal}", f"MACDh_{fast}_{slow}_{signal}", f"MACDs_{fast}_{slow}_{signal}"])
+                elif name.startswith("BB") or name.startswith("BOLL"):
+                    length = _length_from_name(name, 10)
+                    df.ta.bbands(length=length, append=True)
+                    output_keys.extend([f"BBL_{length}_2.0", f"BBM_{length}_2.0", f"BBU_{length}_2.0"])
+                elif name.startswith("ROC"):
+                    length = _length_from_name(name, 10)
+                    df.ta.roc(length=length, append=True)
+                    output_keys.append(f"ROC_{length}")
+                elif name.startswith("MOM"):
+                    length = _length_from_name(name, 10)
+                    df.ta.mom(length=length, append=True)
+                    output_keys.append(f"MOM_{length}")
+                elif name.startswith("ATR"):
+                    length = _length_from_name(name, 14)
+                    if {"high", "low", "close"}.issubset(df.columns):
+                        df.ta.atr(length=length, append=True)
+                        output_keys.append(f"ATRr_{length}")
+                    else:
+                        unsupported.append(f"{name}: requires high/low/close")
+                elif name.startswith("VOLATILITY"):
+                    length = _length_from_name(name, 12)
+                    key = f"VOLATILITY_{length}"
+                    df[key] = df["close"].pct_change().rolling(length).std()
+                    output_keys.append(key)
+                elif name in ("RETURN", "CUM_RETURN", "CUMULATIVE_RETURN"):
+                    first_close = df["close"].dropna().iloc[0]
+                    key = "CUM_RETURN"
+                    df[key] = (df["close"] / first_close) - 1 if first_close else None
+                    output_keys.append(key)
+                else:
+                    unsupported.append(name)
+            except Exception as e:
+                print(f"⚠️ snapshot 指标计算失败 {normalized_symbol} {name}: {e}")
+                unsupported.append(f"{name}: {e}")
+
+        deduped_keys = list(dict.fromkeys(output_keys))
+        latest = df.iloc[-1]
+        indicators: Dict[str, Any] = {}
+        for key in deduped_keys:
+            value = latest.get(key) if hasattr(latest, "get") else None
+            try:
+                indicators[key] = None if pd.isna(value) else float(value)
+            except Exception:
+                indicators[key] = None
+
+        window_rows: List[Dict[str, Any]] = []
+        for ts, row in df.tail(3).iterrows():
+            item: Dict[str, Any] = {"timestamp": ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts)}
+            for key in deduped_keys:
+                value = row.get(key)
+                try:
+                    item[key] = None if pd.isna(value) else float(value)
+                except Exception:
+                    item[key] = None
+            window_rows.append(item)
+
+        return {
+            "source": "snapshot_hourly_3d_calculated",
+            "symbol": normalized_symbol,
+            "timestamp": str(df.index[-1]),
+            "requested_indicators": requested,
+            "supported_indicators": ["RSI_N", "SMA_N", "EMA_N", "MACD_FAST_SLOW_SIGNAL", "BBANDS_N", "ATR_N", "ROC_N", "MOM_N", "VOLATILITY_N", "CUM_RETURN"],
+            "unsupported_indicators": unsupported,
+            "input_candles": int(len(df)),
+            "indicators": indicators,
+            "indicator_window": window_rows,
+        }
+
+    def _load_hourly_candles_for_indicator_tool(
+        self,
+        normalized_symbol: str,
+        end_date: str,
+        lookback_days: int,
+    ) -> List[Dict[str, Any]]:
+        lookback_hours = max(int(lookback_days or 3) * 24, 24)
+        candles = self._get_snapshot_hourly_candles(normalized_symbol, end_date, lookback_hours)
+        if candles:
+            return candles
+        if self._strict_snapshot_mode():
+            return []
+        plain_symbol = strip_exchange_prefix(normalized_symbol) or normalized_symbol
+        if not self.dm:
+            return []
+        try:
+            df = self.dm.get_hourly_stock_data(
+                symbol=plain_symbol,
+                end_date=end_date,
+                lookback_hours=lookback_hours,
+            )
+        except Exception:
+            return []
+        if df is None or df.empty:
+            return []
+        df = df.sort_index()
+        candles = []
+        for ts, row in df.iterrows():
+            candles.append({
+                "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts),
+                "open": float(row.get("open")) if row.get("open") is not None and not pd.isna(row.get("open")) else None,
+                "high": float(row.get("high")) if row.get("high") is not None and not pd.isna(row.get("high")) else None,
+                "low": float(row.get("low")) if row.get("low") is not None and not pd.isna(row.get("low")) else None,
+                "close": float(row.get("close")) if row.get("close") is not None and not pd.isna(row.get("close")) else None,
+                "volume": float(row.get("volume")) if row.get("volume") is not None and not pd.isna(row.get("volume")) else None,
+            })
+        return candles
     
     def get_hourly_stock_data(self, symbol: str, end_time: str, lookback_hours: Optional[int] = 24) -> str:
         """
@@ -738,6 +1197,18 @@ class AgenticWorkflow:
             window = lookback_hours or 24
             plain_symbol = strip_exchange_prefix(normalized_symbol) if normalized_symbol else symbol
             query_symbol = plain_symbol or symbol
+            snapshot_candles = self._get_snapshot_hourly_candles(normalized_symbol, end_time, int(window)) if normalized_symbol else []
+            if snapshot_candles:
+                return json.dumps(
+                    self._build_hourly_tool_payload(
+                        symbol=symbol,
+                        normalized_symbol=normalized_symbol or symbol,
+                        lookback_hours=int(window),
+                        candles=snapshot_candles,
+                        source="snapshot_hourly_3d",
+                    ),
+                    ensure_ascii=False,
+                )
             
             # 优先尝试从快照中获取当前价格（如果只需要当前价格或少量历史数据）
             # 快照中包含 prices_3d（过去3天的价格点），可以用于构建简单的历史数据
@@ -778,9 +1249,26 @@ class AgenticWorkflow:
                         except Exception as e:
                             # 如果从快照构建失败，继续使用 DataManager
                             pass
+
+                    if self._strict_snapshot_mode():
+                        if summary or prices_3d:
+                            return json.dumps({
+                                "source": "snapshot",
+                                "symbol": normalized_symbol,
+                                "lookback_hours": window,
+                                "granularity": "decision_anchor_points",
+                                "note": "旧 snapshot 不含真实小时线，仅返回 3 天决策时点价格；不是 60 分钟 K 线。",
+                                "summary": summary,
+                                "price_points_3d": prices_3d,
+                            }, ensure_ascii=False)
             
             # 如果快照中没有足够的数据，或需要更多历史数据，使用 DataManager
             if df is None or df.empty:
+                if self._strict_snapshot_mode():
+                    return json.dumps({
+                        "error": "回测模式：未找到 snapshot 中的小时线数据（不访问实时行情源）",
+                        "symbol": normalized_symbol,
+                    }, ensure_ascii=False)
                 if not self.dm:
                     return json.dumps({"error": "DataManager 未初始化且快照中无数据"})
                 
@@ -890,21 +1378,26 @@ class AgenticWorkflow:
         df.set_index("timestamp", inplace=True)
         return df
     
-    def get_technical_indicators(self, symbol: str, end_date: str, lookback_days: int = 10) -> str:
+    def get_technical_indicators(
+        self,
+        symbol: str,
+        end_date: str,
+        lookback_days: int = 10,
+        indicators: Optional[List[str]] = None,
+    ) -> str:
         """
-        获取技术指标：读取历史小时线指标 + 计算实时小时线指标 + 保存更新到 ai_stock_data.json
+        获取技术指标。回测模式下基于 shared snapshot 中的真实小时线按需计算；
+        非严格模式才会回退到 DataManager / ai_stock_data.json。
         
         Args:
             symbol (str): 股票代码
             end_date (str): 结束日期 (YYYY-MM-DD) 或结束时间 (YYYY-MM-DD HH:MM:SS)
-            lookback_days (int): 用于计算指标的历史数据天数，默认30天（转换为小时数）
+            lookback_days (int): 用于计算指标的历史数据天数
+            indicators: 可选指标列表，例如 ["RSI_3", "MACD_12_26_9", "SMA_5", "VOLATILITY_12"]
             
         Returns:
             str: JSON字符串，包含历史小时线指标和实时小时线指标
         """
-        if not self.dm:
-            return json.dumps({"error": "DataManager 未初始化"})
-        
         normalized_symbol = normalize_symbol(symbol)
         if not self._is_allowed_symbol(normalized_symbol, allow_sell_existing=True):
             return json.dumps({
@@ -912,6 +1405,51 @@ class AgenticWorkflow:
                 "allowed_symbols": self._allowed_symbol_list(),
                 "symbol": normalized_symbol
             }, ensure_ascii=False)
+
+        snapshot_payload = self._prefetched_indicators.get(normalized_symbol) if self._prefetched_indicators else None
+        tool_candles = self._load_hourly_candles_for_indicator_tool(
+            normalized_symbol,
+            end_date,
+            lookback_days,
+        ) if normalized_symbol else []
+        calculated_payload = self._calculate_indicators_from_snapshot_candles(
+            normalized_symbol,
+            end_date,
+            lookback_days,
+            indicators,
+            candles_override=tool_candles,
+        ) if normalized_symbol else None
+        if indicators and calculated_payload:
+            return json.dumps(calculated_payload, ensure_ascii=False)
+        if indicators and not calculated_payload:
+            return json.dumps({
+                "error": "无法计算请求的技术指标：没有足够的小时线价格数据",
+                "symbol": normalized_symbol,
+                "requested_indicators": indicators,
+                "lookback_days": lookback_days,
+                "supported_indicators": ["RSI_N", "SMA_N", "EMA_N", "MACD_FAST_SLOW_SIGNAL", "BBANDS_N", "ATR_N", "ROC_N", "MOM_N", "VOLATILITY_N", "CUM_RETURN"],
+                "data_source_attempted": "snapshot_hourly_3d" if self._strict_snapshot_mode() else "snapshot_hourly_3d_or_datamanager",
+            }, ensure_ascii=False)
+        if isinstance(snapshot_payload, dict):
+            return json.dumps({
+                "source": "snapshot",
+                "symbol": normalized_symbol,
+                "timestamp": snapshot_payload.get("anchor_time") or end_date,
+                "indicators": snapshot_payload.get("indicators", {}),
+                "price_indicators": snapshot_payload.get("price_indicators", {}),
+                "indicators_3d": snapshot_payload.get("indicators_3d", []),
+                "note": "如需更多指标，可传入 indicators，例如 ['RSI_3','SMA_5','VOLATILITY_12']。",
+            }, ensure_ascii=False)
+        if calculated_payload and self._strict_snapshot_mode():
+            return json.dumps(calculated_payload, ensure_ascii=False)
+        if self._strict_snapshot_mode():
+            return json.dumps({
+                "error": "回测模式：未找到 snapshot 中的技术指标数据（不访问实时行情源）",
+                "symbol": normalized_symbol,
+            }, ensure_ascii=False)
+
+        if not self.dm:
+            return json.dumps({"error": "DataManager 未初始化"})
         
         try:
             # 1. 读取历史小时线指标与行情（从 ai_stock_data.json，使用JsonFileManager）
@@ -965,10 +1503,8 @@ class AgenticWorkflow:
             
             # 2. 组装指标字段白名单
             indicator_keys = [
-                'SMA_10',
                 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
-                'RSI_10',
-                'BBL_10_2.0', 'BBM_10_2.0', 'BBU_10_2.0'
+                'RSI_3',
             ]
 
             def build_indicator_payload(source_label: str, indicator_dict: Dict[str, Any], timestamp_hint: Optional[Any] = None, include_saved_path: bool = False) -> str:
@@ -1091,13 +1627,10 @@ class AgenticWorkflow:
                 if 'close' not in df.columns:
                     raise Exception("DataFrame缺少'close'列")
                 
-                # 计算技术指标（基于小时线数据）
-                # 使用10天参数计算指标
-                df.ta.sma(length=10, append=True)
-                df.ta.macd(append=True)
-                df.ta.rsi(length=10, append=True)
-                df.ta.bbands(length=10, append=True)
-                print(f"📊 基于合并小时线数据（历史+实时，共{len(df)}条）计算技术指标（10天）")
+                # 计算技术指标（基于小时线数据），默认口径与回测 snapshot 保持一致
+                df.ta.macd(fast=12, slow=26, signal=9, append=True)
+                df.ta.rsi(length=3, append=True)
+                print(f"📊 基于合并小时线数据（历史+实时，共{len(df)}条）计算技术指标（RSI_3 + MACD_12_26_9）")
             except Exception as e:
                 print(f"⚠️ 计算技术指标失败: {e}")
                 if historical_indicators:
@@ -1172,7 +1705,7 @@ class AgenticWorkflow:
                 "action": "no_trade",
                 "date": today_date,
                 "decision_time": decision_time,
-                "agentic workflow": self.signature
+                "signature": self.signature
             })
         except Exception as e:
             return json.dumps({"error": f"添加无交易记录时出错: {str(e)}"})
@@ -1233,6 +1766,37 @@ class AgenticWorkflow:
         except Exception:
             return None, None
         return None, None
+
+    def _strict_snapshot_mode(self) -> bool:
+        """回测模式：工具只读 news.csv / shared snapshot，不访问实时外部数据源。"""
+        if getattr(self, "_building_snapshot", False):
+            return False
+        for env_key in ("BACKTEST_MODE", "STRICT_SNAPSHOT_MODE"):
+            raw = os.getenv(env_key)
+            if raw is not None and str(raw).strip() != "":
+                return str(raw).strip().lower() in ("1", "true", "yes", "on")
+        return True
+
+    def _get_snapshot_price(self, normalized_symbol: str) -> Optional[float]:
+        price, _ = self._get_prefetched_trade_price(normalized_symbol)
+        return price
+
+    def _estimate_position_value(self, symbol: str, shares: int, fallback_price: Optional[float] = None) -> float:
+        normalized_symbol = normalize_symbol(symbol) or symbol
+        price = self._get_snapshot_price(normalized_symbol)
+        if price is None:
+            price = fallback_price
+        if price is None and self.dm:
+            current_time = self._get_context_value("CURRENT_TIME")
+            today_date = self._get_context_value("TODAY_DATE") or self.init_date
+            try:
+                price = self.dm.get_price_at(normalized_symbol, current_time or f"{today_date} 15:00:00")
+            except Exception:
+                price = None
+        try:
+            return float(price) * int(shares) if price is not None else 0.0
+        except Exception:
+            return 0.0
     
     def buy_stock(self, symbol: str, amount: int) -> str:
         """
@@ -1257,6 +1821,12 @@ class AgenticWorkflow:
             if not normalized_symbol:
                 return json.dumps({"error": "无效的股票代码"})
             data_symbol = strip_exchange_prefix(normalized_symbol) or normalized_symbol
+            try:
+                amount = int(amount)
+            except Exception:
+                return json.dumps({"error": "买入数量必须是正整数", "symbol": normalized_symbol, "amount": amount}, ensure_ascii=False)
+            if amount <= 0:
+                return json.dumps({"error": "买入数量必须大于0", "symbol": normalized_symbol, "amount": amount}, ensure_ascii=False)
 
             if not self._is_allowed_symbol(normalized_symbol, allow_sell_existing=True):
                 return json.dumps({
@@ -1371,35 +1941,33 @@ class AgenticWorkflow:
                     ensure_ascii=False,
                 )
             
-            limit_info: Optional[Dict[str, float]] = None
-            prev_close = self._get_previous_close(normalized_symbol, today_date)
-            limit_info = get_price_limits(normalized_symbol, prev_close)
-            allowed, reason = self._passes_price_limit_liquidity("sell", this_symbol_price, limit_info)
-            if not allowed:
-                return json.dumps({
-                    "error": reason,
-                    "symbol": normalized_symbol,
-                    "price": this_symbol_price,
-                    "limit_info": limit_info
-                }, ensure_ascii=False)
-            
             # --- 风险管理检查 ---
             single_stock_max_position = self.risk_management.get("single_stock_max_position", 0.50)
             total_assets = current_position.get("CASH", 0)
             for stock, data in current_position.items():
-                if stock != "CASH":
-                    # 假设我们需要一个价格来估算当前股票价值，这里用今天的开盘价
-                    # 在真实场景中，可能需要更复杂的价格获取逻辑
-                    stock_value = data.get("shares", 0) * this_symbol_price # 估算
-                    total_assets += stock_value
+                if stock != "CASH" and isinstance(data, dict):
+                    total_assets += self._estimate_position_value(
+                        stock,
+                        int(data.get("shares", 0) or 0),
+                        fallback_price=this_symbol_price if normalize_symbol(stock) == normalized_symbol else None,
+                    )
 
             required_cash = this_symbol_price * amount
-            if (required_cash / total_assets) > single_stock_max_position:
+            if total_assets <= 0:
+                return json.dumps({"error": "总资产无效，无法进行风险检查"}, ensure_ascii=False)
+            existing_value = self._estimate_position_value(
+                normalized_symbol,
+                int(current_position.get(normalized_symbol, {}).get("shares", 0) or 0)
+                if isinstance(current_position.get(normalized_symbol), dict) else 0,
+                fallback_price=this_symbol_price,
+            )
+            if ((existing_value + required_cash) / total_assets) > single_stock_max_position:
                  return json.dumps({
                     "error": f"单只股票持仓超过上限 ({single_stock_max_position * 100}%)",
                     "symbol": normalized_symbol,
                     "max_allowed_investment": total_assets * single_stock_max_position,
-                    "requested_investment": required_cash
+                    "requested_investment": required_cash,
+                    "existing_investment": existing_value
                 })
 
             # --- 交易成本计算 ---
@@ -1426,7 +1994,10 @@ class AgenticWorkflow:
             allowed, reason = self._passes_price_limit_liquidity("buy", this_symbol_price, limit_info)
             if not allowed:
                 return json.dumps({
+                    "success": False,
                     "error": reason,
+                    "trade_failed_reason": reason,
+                    "action": "buy",
                     "symbol": normalized_symbol,
                     "price": this_symbol_price,
                     "limit_info": limit_info
@@ -1450,11 +2021,15 @@ class AgenticWorkflow:
                     weighted_avg = this_symbol_price
                 existing_entry["shares"] = total_shares
                 existing_entry["avg_price"] = weighted_avg
+                lots = existing_entry.get("lots") if isinstance(existing_entry.get("lots"), list) else []
+                lots.append({"shares": amount, "purchase_date": today_date, "avg_price": this_symbol_price})
+                existing_entry["lots"] = lots
             else:
                 new_position[normalized_symbol] = {
                     "shares": amount,
                     "purchase_date": today_date,
-                    "avg_price": this_symbol_price
+                    "avg_price": this_symbol_price,
+                    "lots": [{"shares": amount, "purchase_date": today_date, "avg_price": this_symbol_price}]
                 }
 
             new_position = normalize_positions(new_position)
@@ -1490,8 +2065,185 @@ class AgenticWorkflow:
         
         except Exception as e:
             return json.dumps({"error": f"买入股票时出错: {str(e)}"})
+
+    def _build_news_tool_payload(
+        self,
+        source: str,
+        normalized_symbol: str,
+        query: str,
+        start_time: Optional[Any],
+        end_time: Optional[Any],
+        lookback_days: int,
+        news_items: List[Dict[str, Any]],
+        max_results: int,
+    ) -> Dict[str, Any]:
+        news_items = sorted(news_items, key=lambda item: str(item.get("publish_time") or ""), reverse=True)
+        total_count = len(news_items)
+        if max_results and max_results > 0:
+            returned_news = news_items[:max_results]
+        else:
+            returned_news = news_items
+        return {
+            "success": True,
+            "source": source,
+            "symbol": normalized_symbol,
+            "query": query,
+            "lookback_days": lookback_days,
+            "start_time": str(start_time) if start_time is not None else None,
+            "end_time": str(end_time) if end_time is not None else None,
+            "total_count": total_count,
+            "returned_count": len(returned_news),
+            "truncated": len(returned_news) < total_count,
+            "news": returned_news,
+        }
+
+    def _snapshot_news_payload(
+        self,
+        normalized_symbol: str,
+        query: str,
+        start_time: Optional[Any],
+        end_time: Optional[Any],
+        lookback_days: int,
+        max_results: int,
+    ) -> Optional[Dict[str, Any]]:
+        cached_news = self._prefetched_news.get(normalized_symbol)
+        if not isinstance(cached_news, dict):
+            return None
+        raw_items = cached_news.get("news") or []
+        news_items = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            news_items.append({
+                "title": item.get("title") or item.get("新闻标题") or "",
+                "content": item.get("content") or item.get("新闻内容") or "",
+                "publish_time": item.get("publish_time") or item.get("发布时间") or "",
+                "source": item.get("source") or "snapshot",
+                "url": item.get("url") or item.get("新闻链接") or "",
+                "symbol": normalized_symbol,
+            })
+        return self._build_news_tool_payload(
+            "snapshot",
+            normalized_symbol,
+            query,
+            start_time,
+            end_time,
+            lookback_days,
+            news_items,
+            max_results,
+        )
+
+    def _read_news_csv_range(
+        self,
+        normalized_symbol: str,
+        query: str,
+        end_time: str,
+        lookback_days: int,
+        max_results: int,
+    ) -> Dict[str, Any]:
+        end_dt = pd.to_datetime(end_time, errors="coerce")
+        if end_dt is None or pd.isna(end_dt):
+            end_dt = pd.Timestamp.now()
+        if getattr(end_dt, "tzinfo", None) is not None:
+            end_dt = end_dt.tz_convert("Asia/Shanghai").tz_localize(None)
+        try:
+            lookback_days = max(int(lookback_days), 1)
+        except Exception:
+            lookback_days = 3
+        start_dt = end_dt - pd.Timedelta(days=lookback_days)
+
+        csv_path = self.news_csv_path or os.path.join(project_root, "data_flow", "news.csv")
+        news_items: List[Dict[str, Any]] = []
+        if not csv_path or not os.path.exists(csv_path):
+            return self._build_news_tool_payload(
+                "news_csv",
+                normalized_symbol,
+                query,
+                start_dt,
+                end_dt,
+                lookback_days,
+                [],
+                max_results,
+            )
+
+        df = None
+        for encoding in ("utf-8", "utf-8-sig", "gbk", "gb18030", "latin1"):
+            try:
+                df = pd.read_csv(csv_path, encoding=encoding)
+                break
+            except Exception:
+                continue
+        if df is None or df.empty:
+            return self._build_news_tool_payload("news_csv", normalized_symbol, query, start_dt, end_dt, lookback_days, [], max_results)
+
+        df = self._sanitize_news_dataframe(df)
+        plain_symbol = strip_exchange_prefix(normalized_symbol) or normalized_symbol
+        if "symbol" in df.columns:
+            symbol_series = df["symbol"].astype(str).apply(lambda value: normalize_symbol(value))
+            df = df[symbol_series == normalized_symbol]
+        else:
+            text_cols = [col for col in ("title", "新闻标题", "content", "新闻内容", "query") if col in df.columns]
+            if text_cols:
+                mask = pd.Series(False, index=df.index)
+                for col in text_cols:
+                    mask = mask | df[col].astype(str).str.contains(plain_symbol, na=False)
+                df = df[mask]
+
+        if df.empty:
+            return self._build_news_tool_payload("news_csv", normalized_symbol, query, start_dt, end_dt, lookback_days, [], max_results)
+
+        timestamp_col = None
+        for col in ("publish_time", "发布时间", "datetime", "date", "time", "search_time"):
+            if col in df.columns:
+                timestamp_col = col
+                break
+        if timestamp_col:
+            parsed_ts = pd.to_datetime(df[timestamp_col], errors="coerce")
+        else:
+            parsed_ts = pd.Series(pd.NaT, index=df.index)
+        if parsed_ts.dt.tz is not None:
+            parsed_ts = parsed_ts.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+        df = df.assign(_parsed_publish_time=parsed_ts)
+        df = df[
+            df["_parsed_publish_time"].isna()
+            | ((df["_parsed_publish_time"] >= start_dt) & (df["_parsed_publish_time"] <= end_dt))
+        ]
+        df = df.sort_values("_parsed_publish_time", ascending=False, na_position="last")
+
+        for _, row in df.iterrows():
+            publish_time = row.get("_parsed_publish_time")
+            if pd.isna(publish_time):
+                publish_text = str(row.get(timestamp_col, "")) if timestamp_col else ""
+            else:
+                publish_text = publish_time.strftime("%Y-%m-%d %H:%M:%S")
+            news_items.append({
+                "title": str(row.get("title") or row.get("新闻标题") or "").strip(),
+                "content": str(row.get("content") or row.get("新闻内容") or "").strip(),
+                "publish_time": publish_text,
+                "source": str(row.get("source") or row.get("新闻来源") or "").strip(),
+                "url": str(row.get("url") or row.get("新闻链接") or "").strip(),
+                "symbol": normalized_symbol,
+            })
+
+        return self._build_news_tool_payload(
+            "news_csv",
+            normalized_symbol,
+            query,
+            start_dt,
+            end_dt,
+            lookback_days,
+            news_items,
+            max_results,
+        )
     
-    def search_stock_news(self, query: str, max_retries: int = 3, current_time: Optional[str] = None) -> str:
+    def search_stock_news(
+        self,
+        query: str,
+        max_retries: int = 3,
+        current_time: Optional[str] = None,
+        lookback_days: int = 3,
+        max_results: int = 100,
+    ) -> str:
         """
         搜索股票相关的实时新闻 + 读取历史新闻，使用 AKShare，失败重试。
         同时会从 DataManager 读取历史新闻，并将新闻保存到 news.csv
@@ -1499,6 +2251,9 @@ class AgenticWorkflow:
         Args:
             query: 搜索关键词（如 "600519 最新消息"）
             max_retries: 最大重试次数，默认3次
+            current_time: 结束时间；缺省使用当前决策时刻
+            lookback_days: 向前读取多少天的 news.csv 缓存新闻，例如 7 表示近一周
+            max_results: 最多返回多少条；<=0 表示不截断
         
         Returns:
             str: JSON字符串，包含历史新闻和实时新闻
@@ -1531,10 +2286,6 @@ class AgenticWorkflow:
                 "allowed_symbols": self._allowed_symbol_list()
             }, ensure_ascii=False)
 
-        cached_news = self._prefetched_news.get(normalized_symbol)
-        if cached_news:
-            return json.dumps(cached_news, ensure_ascii=False)
-
         today_date = get_runtime_config_value("TODAY_DATE")
         runtime_current_time = get_runtime_config_value("CURRENT_TIME")
         current_time = current_time or runtime_current_time
@@ -1544,6 +2295,41 @@ class AgenticWorkflow:
             search_time = f"{today_date} 00:00:00"
         else:
             search_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            lookback_days = max(int(lookback_days), 1)
+        except Exception:
+            lookback_days = 3
+        try:
+            max_results = int(max_results)
+        except Exception:
+            max_results = 100
+
+        csv_payload = self._read_news_csv_range(
+            normalized_symbol=normalized_symbol,
+            query=query,
+            end_time=search_time,
+            lookback_days=lookback_days,
+            max_results=max_results,
+        )
+        if csv_payload.get("total_count", 0) > 0:
+            return json.dumps(csv_payload, ensure_ascii=False)
+
+        snapshot_payload = self._snapshot_news_payload(
+            normalized_symbol=normalized_symbol,
+            query=query,
+            start_time=csv_payload.get("start_time"),
+            end_time=csv_payload.get("end_time"),
+            lookback_days=lookback_days,
+            max_results=max_results,
+        )
+        if self._strict_snapshot_mode():
+            if snapshot_payload and snapshot_payload.get("total_count", 0) > 0:
+                return json.dumps(snapshot_payload, ensure_ascii=False)
+            csv_payload["message"] = "回测模式：news.csv 与 snapshot 中均未找到新闻缓存（不访问实时新闻源）。"
+            return json.dumps(csv_payload, ensure_ascii=False)
+        if snapshot_payload and snapshot_payload.get("total_count", 0) > 0:
+            return json.dumps(snapshot_payload, ensure_ascii=False)
 
         # 增量过滤逻辑已移除，改回返回完整历史+实时新闻
 
@@ -1894,6 +2680,12 @@ class AgenticWorkflow:
             if not normalized_symbol:
                 return json.dumps({"error": "无效的股票代码"})
             data_symbol = strip_exchange_prefix(normalized_symbol) or normalized_symbol
+            try:
+                amount = int(amount)
+            except Exception:
+                return json.dumps({"error": "卖出数量必须是正整数", "symbol": normalized_symbol, "amount": amount}, ensure_ascii=False)
+            if amount <= 0:
+                return json.dumps({"error": "卖出数量必须大于0", "symbol": normalized_symbol, "amount": amount}, ensure_ascii=False)
             
             # 使用实例上下文，避免从共享 runtime_env.json 读取
             today_date = self._get_context_value("TODAY_DATE")
@@ -1908,16 +2700,6 @@ class AgenticWorkflow:
             # 获取当前持仓和操作ID
             current_position, current_action_id, latest_record = get_current_position(today_date, self.signature)
             
-            # --- T+1 规则检查 ---
-            if normalized_symbol in current_position and isinstance(current_position[normalized_symbol], dict):
-                purchase_date = current_position[normalized_symbol].get("purchase_date")
-                if purchase_date == today_date:
-                    return json.dumps({
-                        "error": "T+1规则限制：今日买入的股票不能在当日卖出",
-                        "symbol": normalized_symbol,
-                        "purchase_date": purchase_date
-                    })
-
             # 获取当前时刻的股票价格：
             # 优先使用共享 snapshot 的价格；缺失时再回退到 DataManager（小时级→日线），避免多模型价格不一致
             price_source = None
@@ -2002,7 +2784,10 @@ class AgenticWorkflow:
             allowed, reason = self._passes_price_limit_liquidity("sell", this_symbol_price, limit_info)
             if not allowed:
                 return json.dumps({
+                    "success": False,
                     "error": reason,
+                    "trade_failed_reason": reason,
+                    "action": "sell",
                     "symbol": normalized_symbol,
                     "price": this_symbol_price,
                     "limit_info": limit_info
@@ -2012,7 +2797,8 @@ class AgenticWorkflow:
             if normalized_symbol not in current_position or not isinstance(current_position[normalized_symbol], dict):
                 return json.dumps({"error": f"未持有股票 {normalized_symbol}！交易不被允许。", "symbol": normalized_symbol, "date": today_date})
             
-            current_shares = current_position.get(normalized_symbol, {}).get("shares", 0)
+            position_entry = current_position.get(normalized_symbol, {})
+            current_shares = position_entry.get("shares", 0)
             if current_shares < amount:
                 return json.dumps({
                     "error": "持股数量不足！交易不被允许。",
@@ -2021,13 +2807,27 @@ class AgenticWorkflow:
                     "symbol": normalized_symbol,
                     "date": today_date
                 })
+            available_shares = get_available_sell_shares(position_entry, today_date)
+            if available_shares < amount:
+                return json.dumps({
+                    "error": "T+1规则限制：可卖持仓数量不足",
+                    "symbol": normalized_symbol,
+                    "available_to_sell": available_shares,
+                    "want_to_sell": amount,
+                    "date": today_date
+                }, ensure_ascii=False)
             
             # 执行卖出操作
             new_position = copy.deepcopy(current_position)
-            new_position[normalized_symbol]["shares"] = current_shares - amount
+            remaining_lots = remove_shares_from_lots(new_position[normalized_symbol], amount, today_date)
+            remaining_shares, earliest_date, weighted_avg = summarize_lots(remaining_lots)
+            new_position[normalized_symbol]["shares"] = remaining_shares
+            new_position[normalized_symbol]["purchase_date"] = earliest_date
+            new_position[normalized_symbol]["avg_price"] = weighted_avg
+            new_position[normalized_symbol]["lots"] = remaining_lots
             
             # 如果股票数量为0，则从持仓中移除
-            if new_position[normalized_symbol]["shares"] == 0:
+            if remaining_shares == 0:
                 del new_position[normalized_symbol]
 
             revenue = this_symbol_price * amount
@@ -2104,7 +2904,10 @@ class AgenticWorkflow:
             gemini_safety_settings = None
             if self.safety_settings:
                 try:
-                    from google.genai.types import HarmCategory, HarmBlockThreshold
+                    import importlib
+                    genai_types = importlib.import_module("google.genai.types")
+                    HarmCategory = getattr(genai_types, "HarmCategory")
+                    HarmBlockThreshold = getattr(genai_types, "HarmBlockThreshold")
                     gemini_safety_settings = {}
                     harm_category_map = {
                         "HARM_CATEGORY_HARASSMENT": HarmCategory.HARM_CATEGORY_HARASSMENT,
@@ -2189,16 +2992,20 @@ class AgenticWorkflow:
                 **model_kwargs
             )
             print(f"✅ Qwen model initialized via {dashscope_url}" + (f" (thinking: {extra_body.get('enable_thinking')})" if extra_body.get('enable_thinking') else ""))
-        elif "reasoner" in self.basemodel.lower():
+        elif self._model_uses_reasoning():
             print(f"🤖 Initializing Reasoner model: {self.basemodel} (with extended timeout)")
             # Process parameters for Reasoner models
             extra_body = {}
             model_kwargs = {}
             if self.parameters:
+                if "reasoning" in self.parameters:
+                    extra_body["reasoning"] = self.parameters["reasoning"]
                 if "max_tokens" in self.parameters:
                     model_kwargs["max_tokens"] = self.parameters["max_tokens"]
                 if "temperature" in self.parameters:
                     model_kwargs["temperature"] = self.parameters["temperature"]
+            if "reasoning" not in extra_body:
+                extra_body["reasoning"] = {"enabled": True}
             
             self.model = ChatOpenAI(
                 model=self.basemodel,
@@ -2251,7 +3058,11 @@ class AgenticWorkflow:
                 print(f"⚠️  注意: 使用 /anthropic 端点，如果遇到 404 错误，请检查代理平台是否支持此端点")
             
             # 检测推理参数，如果有推理能力，使用更长的超时时间
-            has_reasoning = "reasoning_effort" in extra_body or "reasoning" in extra_body or "max_completion_tokens" in extra_body
+            has_reasoning = self._model_uses_reasoning() or (
+                "reasoning_effort" in extra_body
+                or self._reasoning_enabled_in_extra_body(extra_body)
+                or "max_completion_tokens" in extra_body
+            )
             # 对于推理模型，使用1200秒（20分钟）超时，特别是对于high reasoning_effort和大max_completion_tokens的情况
             timeout_value = 1200 if has_reasoning else 720
             max_retries_value = 5 if has_reasoning else 3
@@ -2270,6 +3081,30 @@ class AgenticWorkflow:
             print(f"✅ OpenAI-compatible model initialized" + (f" (parameters: {list(extra_body.keys())})" if extra_body else ""))
         
         print(f"✅ Agent {self.signature} initialization completed")
+    def _reasoning_enabled_in_extra_body(self, extra_body: Dict[str, Any]) -> bool:
+        reasoning = extra_body.get("reasoning")
+        if isinstance(reasoning, dict):
+            enabled = reasoning.get("enabled")
+            if enabled is False:
+                return False
+            if enabled is True or reasoning.get("effort") or reasoning.get("max_tokens"):
+                return True
+        return isinstance(reasoning, str) and bool(reasoning.strip())
+
+    def _model_uses_reasoning(self) -> bool:
+        if "reasoner" in (self.basemodel or "").lower() or (self.signature or "").endswith("reasoner"):
+            return True
+        reasoning = (self.parameters or {}).get("reasoning")
+        if isinstance(reasoning, dict):
+            enabled = reasoning.get("enabled")
+            if enabled is False:
+                return False
+            if enabled is True or reasoning.get("effort") or reasoning.get("max_tokens"):
+                return True
+        if (self.parameters or {}).get("reasoning_effort"):
+            return True
+        return False
+
     def _setup_logging(self, today_date: str, decision_time: str) -> str:
         """Set up (and reset) log file path for a specific decision time"""
         log_path = os.path.join(self.base_log_path, self.signature, 'log', today_date)
@@ -2279,6 +3114,13 @@ class AgenticWorkflow:
         with open(log_file, "w", encoding="utf-8") as f:
             f.write("")
         return log_file
+
+    def _run_artifact_dir(self, today_date: str, decision_time: str) -> str:
+        """Human-readable per-decision artifacts live beside the raw jsonl stream."""
+        time_part = str(decision_time).split()[-1].replace(":", "-")
+        run_dir = os.path.join(self.base_log_path, self.signature, "runs", today_date, time_part)
+        os.makedirs(run_dir, exist_ok=True)
+        return run_dir
     
     def _log_message(
         self,
@@ -2298,6 +3140,673 @@ class AgenticWorkflow:
         }
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+
+    def _to_jsonable(self, value: Any) -> Any:
+        """Convert LangChain/Pydantic objects into JSON-safe data without truncation."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): self._to_jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._to_jsonable(item) for item in value]
+        if hasattr(value, "model_dump"):
+            try:
+                return self._to_jsonable(value.model_dump())
+            except Exception:
+                pass
+        if hasattr(value, "dict"):
+            try:
+                return self._to_jsonable(value.dict())
+            except Exception:
+                pass
+        return str(value)
+
+    def _serialize_full_message(self, message: Any) -> Dict[str, Any]:
+        """Serialize one LangChain message with full content/tool metadata."""
+        if isinstance(message, dict):
+            payload = self._to_jsonable(message)
+            if isinstance(payload, dict):
+                payload.setdefault("message_class", "dict")
+                return payload
+            return {"message_class": "dict", "content": payload}
+
+        payload: Dict[str, Any] = {
+            "message_class": message.__class__.__name__,
+            "type": getattr(message, "type", None),
+        }
+        for field in (
+            "content",
+            "name",
+            "id",
+            "tool_call_id",
+            "tool_calls",
+            "invalid_tool_calls",
+            "additional_kwargs",
+            "response_metadata",
+            "usage_metadata",
+            "artifact",
+            "status",
+        ):
+            if hasattr(message, field):
+                payload[field] = self._to_jsonable(getattr(message, field))
+        return payload
+
+    def _log_full_conversation(
+        self,
+        log_file: str,
+        conversation: Any,
+        decision_time: Optional[str] = None,
+        decision_count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Append the full model/tool transcript for this decision."""
+        try:
+            messages = extract_llm_conversation(conversation, "all")
+        except Exception:
+            messages = []
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "signature": self.signature,
+            "decision_time": decision_time,
+            "decision_count": decision_count,
+            "event_type": "full_conversation",
+            "messages": [self._serialize_full_message(msg) for msg in (messages or [])],
+        }
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        return log_entry
+
+    def _extract_benchmark_decision_report(self, content: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Extract the required decision evidence JSON object from model output."""
+        if not content:
+            return None, "empty_content"
+        import re
+
+        candidates: List[str] = []
+        fenced_blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, flags=re.IGNORECASE | re.DOTALL)
+        candidates.extend(fenced_blocks)
+
+        marker_idx = -1
+        for marker in ('"decision_evidence_report"', '"benchmark_decision_report"'):
+            marker_idx = content.find(marker)
+            if marker_idx >= 0:
+                break
+        if marker_idx >= 0:
+            start = content.rfind("{", 0, marker_idx)
+            if start >= 0:
+                depth = 0
+                in_string = False
+                escape = False
+                for idx in range(start, len(content)):
+                    ch = content[idx]
+                    if escape:
+                        escape = False
+                        continue
+                    if ch == "\\":
+                        escape = True
+                        continue
+                    if ch == '"':
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            candidates.append(content[start: idx + 1])
+                            break
+
+        last_error = "decision_evidence_report_not_found"
+        for raw in candidates:
+            parsed, parse_error = self._parse_llm_json_candidate(raw)
+            if parsed is None:
+                last_error = parse_error or "json_parse_error"
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("decision_evidence_report"), dict):
+                return parsed["decision_evidence_report"], None
+            if isinstance(parsed, dict) and isinstance(parsed.get("benchmark_decision_report"), dict):
+                return parsed["benchmark_decision_report"], None
+        return None, last_error
+
+    def _parse_llm_json_candidate(self, raw: str) -> Tuple[Optional[Any], Optional[str]]:
+        """Parse model-emitted JSON, repairing the common unescaped quote case once."""
+        try:
+            return json.loads(raw), None
+        except Exception as exc:
+            first_error = f"json_parse_error: {exc}"
+
+        repaired = self._escape_unescaped_quotes_inside_json_strings(raw)
+        if repaired == raw:
+            return None, first_error
+        try:
+            return json.loads(repaired), None
+        except Exception as exc:
+            return None, f"{first_error}; repair_failed: {exc}"
+
+    def _escape_unescaped_quotes_inside_json_strings(self, raw: str) -> str:
+        """Escape quote characters that appear inside JSON string values.
+
+        LLMs sometimes copy Chinese news titles containing ASCII quotes, for example
+        ``"被"叫停"！"``. The surrounding object is otherwise valid JSON, so this
+        conservative pass treats a quote inside a string as closing only when the
+        next non-space character is one of JSON's legal string terminators.
+        """
+        result: List[str] = []
+        in_string = False
+        escaped = False
+        changed = False
+        closing_followers = {":", ",", "}", "]"}
+
+        for idx, ch in enumerate(raw):
+            if not in_string:
+                result.append(ch)
+                if ch == '"':
+                    in_string = True
+                    escaped = False
+                continue
+
+            if escaped:
+                result.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                result.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                next_idx = idx + 1
+                while next_idx < len(raw) and raw[next_idx].isspace():
+                    next_idx += 1
+                next_ch = raw[next_idx] if next_idx < len(raw) else ""
+                if next_ch in closing_followers:
+                    result.append(ch)
+                    in_string = False
+                else:
+                    result.append('\\"')
+                    changed = True
+                continue
+            result.append(ch)
+
+        return "".join(result) if changed else raw
+
+    def _latest_decision_report_content_from_conversation(self, conversation: Any) -> Optional[str]:
+        """Return the latest assistant message that actually contains the evidence report."""
+        try:
+            messages = extract_llm_conversation(conversation, "all") or []
+        except Exception:
+            messages = []
+
+        for message in reversed(messages):
+            msg_type = self._message_field(message, "type", "")
+            role = self._message_field(message, "role", "")
+            message_class = message.__class__.__name__ if not isinstance(message, dict) else str(message.get("message_class", ""))
+            is_assistant = (
+                msg_type in ("ai", "assistant")
+                or role == "assistant"
+                or message_class == "AIMessage"
+            )
+            if not is_assistant:
+                continue
+            content = self._content_to_text(self._message_field(message, "content", ""))
+            if '"decision_evidence_report"' in content or '"benchmark_decision_report"' in content:
+                return content
+        return None
+
+    def _validate_benchmark_decision_report(self, report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Lightweight schema validation for audit coverage."""
+        if not isinstance(report, dict):
+            return {
+                "schema_version": None,
+                "schema_valid": False,
+                "missing_required_sections": ["decision_evidence_report"],
+                "schema_warnings": [],
+            }
+
+        schema_version = report.get("schema_version")
+        missing: List[str] = []
+        warnings: List[str] = []
+
+        if schema_version == 2:
+            for field in ("observed_universe", "candidate_review", "actions_planned_or_taken", "workflow_trace"):
+                if field not in report:
+                    missing.append(field)
+
+            observed_universe = report.get("observed_universe")
+            if not isinstance(observed_universe, list) or not observed_universe:
+                warnings.append("observed_universe_empty_or_invalid")
+
+            candidate_review = report.get("candidate_review")
+            if not isinstance(candidate_review, list) or not candidate_review:
+                missing.append("candidate_review.non_empty")
+            else:
+                for idx, candidate in enumerate(candidate_review):
+                    if not isinstance(candidate, dict):
+                        missing.append(f"candidate_review[{idx}]")
+                        continue
+                    for field in ("symbol", "rank", "selected_for_action", "news_evidence_used", "price_evidence_used", "risk_checks_mentioned"):
+                        if field not in candidate:
+                            missing.append(f"candidate_review[{idx}].{field}")
+                    if not candidate.get("buy_reason_text") and not candidate.get("reject_or_hold_reason_text"):
+                        warnings.append(f"candidate_review[{idx}].missing_reason_text")
+                    price_evidence = candidate.get("price_evidence_used")
+                    if not isinstance(price_evidence, dict):
+                        missing.append(f"candidate_review[{idx}].price_evidence_used")
+                    else:
+                        signal_eval = price_evidence.get("signal_evaluation")
+                        if not isinstance(signal_eval, dict):
+                            missing.append(f"candidate_review[{idx}].price_evidence_used.signal_evaluation")
+                        else:
+                            for field in (
+                                "momentum_reading",
+                                "trend_reading",
+                                "risk_reading",
+                                "momentum_trend_conflict",
+                                "decision_implication",
+                            ):
+                                if field not in signal_eval:
+                                    missing.append(f"candidate_review[{idx}].price_evidence_used.signal_evaluation.{field}")
+                    news_evidence = candidate.get("news_evidence_used")
+                    if not isinstance(news_evidence, list):
+                        missing.append(f"candidate_review[{idx}].news_evidence_used")
+                    elif not news_evidence:
+                        warnings.append(f"candidate_review[{idx}].news_evidence_empty")
+                    else:
+                        for news_idx, news_item in enumerate(news_evidence):
+                            if not isinstance(news_item, dict):
+                                missing.append(f"candidate_review[{idx}].news_evidence_used[{news_idx}]")
+                                continue
+                            for field in ("title", "model_interpretation", "claimed_direction"):
+                                if field not in news_item:
+                                    missing.append(f"candidate_review[{idx}].news_evidence_used[{news_idx}].{field}")
+
+            actions = report.get("actions_planned_or_taken")
+            if not isinstance(actions, list) or not actions:
+                missing.append("actions_planned_or_taken.non_empty")
+            else:
+                for idx, action in enumerate(actions):
+                    if not isinstance(action, dict):
+                        missing.append(f"actions_planned_or_taken[{idx}]")
+                        continue
+                    for field in ("action", "reason_text", "risk_controls_cited"):
+                        if field not in action:
+                            missing.append(f"actions_planned_or_taken[{idx}].{field}")
+                    if action.get("action") != "no_trade" and "symbol" not in action:
+                        missing.append(f"actions_planned_or_taken[{idx}].symbol")
+
+            workflow_trace = report.get("workflow_trace")
+            if not isinstance(workflow_trace, dict):
+                missing.append("workflow_trace")
+            else:
+                for field in (
+                    "has_candidate_review",
+                    "has_news_evidence",
+                    "has_price_evidence",
+                    "has_risk_checks",
+                    "has_action_reason",
+                    "missing_required_sections",
+                ):
+                    if field not in workflow_trace:
+                        missing.append(f"workflow_trace.{field}")
+
+        elif schema_version == 1:
+            # Backward-compatible validation for already generated logs.
+            for field in ("workflow_coverage", "candidates", "actions", "risk_summary"):
+                if field not in report:
+                    missing.append(field)
+            warnings.append("legacy_schema_v1")
+        else:
+            missing.append("schema_version")
+
+        deduped_missing = list(dict.fromkeys(missing))
+        return {
+            "schema_version": schema_version,
+            "schema_valid": len(deduped_missing) == 0,
+            "missing_required_sections": deduped_missing,
+            "schema_warnings": list(dict.fromkeys(warnings)),
+        }
+
+    def _log_benchmark_decision_report(
+        self,
+        log_file: str,
+        content: Optional[str],
+        decision_time: Optional[str] = None,
+        decision_count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        report, error = self._extract_benchmark_decision_report(content)
+        validation = self._validate_benchmark_decision_report(report)
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "signature": self.signature,
+            "decision_time": decision_time,
+            "decision_count": decision_count,
+            "event_type": "decision_evidence_report",
+            "parse_success": report is not None,
+            "parse_error": error,
+            **validation,
+            "report": report,
+        }
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        return log_entry
+
+    def _message_field(self, message: Any, key: str, default: Any = None) -> Any:
+        if isinstance(message, dict):
+            return message.get(key, default)
+        return getattr(message, key, default)
+
+    def _tool_call_name(self, call: Any) -> Optional[str]:
+        if isinstance(call, dict):
+            if call.get("name"):
+                return str(call.get("name"))
+            function = call.get("function")
+            if isinstance(function, dict) and function.get("name"):
+                return str(function.get("name"))
+        name = getattr(call, "name", None)
+        return str(name) if name else None
+
+    def _tool_call_id(self, call: Any) -> Optional[str]:
+        if isinstance(call, dict):
+            call_id = call.get("id") or call.get("tool_call_id")
+        else:
+            call_id = getattr(call, "id", None) or getattr(call, "tool_call_id", None)
+        return str(call_id) if call_id else None
+
+    def _tool_result_success(self, content: Any) -> Tuple[bool, Optional[str]]:
+        text = self._content_to_text(content)
+        if not text:
+            return True, None
+        try:
+            payload = json.loads(text)
+        except Exception:
+            lowered = text.lower()
+            if "error" in lowered or "exception" in lowered or "failed" in lowered:
+                return False, self._truncate_text(text, 240)
+            return True, None
+        if isinstance(payload, dict):
+            if payload.get("success") is False:
+                return False, self._truncate_text(str(payload.get("message") or payload), 240)
+            if payload.get("error"):
+                return False, self._truncate_text(str(payload.get("error")), 240)
+        return True, None
+
+    def _extract_tool_call_metrics(self, conversation: Any, elapsed_seconds: float) -> Dict[str, Any]:
+        messages = extract_llm_conversation(conversation, "all") or []
+        calls: List[Dict[str, Any]] = []
+        call_name_by_id: Dict[str, str] = {}
+        result_by_id: Dict[str, Dict[str, Any]] = {}
+
+        for msg in messages:
+            tool_calls = self._message_field(msg, "tool_calls") or []
+            if not tool_calls:
+                additional_kwargs = self._message_field(msg, "additional_kwargs", {}) or {}
+                if isinstance(additional_kwargs, dict):
+                    tool_calls = additional_kwargs.get("tool_calls") or []
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    name = self._tool_call_name(call) or "unknown_tool"
+                    call_id = self._tool_call_id(call)
+                    calls.append({
+                        "name": name,
+                        "tool_call_id": call_id,
+                        "duration_seconds": None,
+                        "success": None,
+                        "error": None,
+                    })
+                    if call_id:
+                        call_name_by_id[call_id] = name
+
+            tool_call_id = self._message_field(msg, "tool_call_id")
+            tool_name = self._message_field(msg, "name")
+            if tool_call_id or tool_name:
+                success, error = self._tool_result_success(self._message_field(msg, "content"))
+                result_by_id[str(tool_call_id) if tool_call_id else f"name:{tool_name}"] = {
+                    "name": str(tool_name) if tool_name else call_name_by_id.get(str(tool_call_id), "unknown_tool"),
+                    "success": success,
+                    "error": error,
+                }
+
+        for call in calls:
+            result = None
+            call_id = call.get("tool_call_id")
+            if call_id:
+                result = result_by_id.get(str(call_id))
+            if result is None:
+                result = result_by_id.get(f"name:{call.get('name')}")
+            if result:
+                call["success"] = result.get("success")
+                call["error"] = result.get("error")
+
+        by_tool: Dict[str, Dict[str, Any]] = {}
+        for call in calls:
+            name = call.get("name") or "unknown_tool"
+            bucket = by_tool.setdefault(name, {"count": 0, "success": 0, "failed": 0, "unknown": 0})
+            bucket["count"] += 1
+            if call.get("success") is True:
+                bucket["success"] += 1
+            elif call.get("success") is False:
+                bucket["failed"] += 1
+            else:
+                bucket["unknown"] += 1
+
+        return {
+            "total_tool_calls": len(calls),
+            "session_elapsed_seconds": round(float(elapsed_seconds), 3),
+            "by_tool": by_tool,
+            "calls": calls,
+        }
+
+    def _log_tool_call_metrics(
+        self,
+        conversation: Any,
+        elapsed_seconds: float,
+        decision_time: Optional[str] = None,
+        decision_count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        metrics_dir = os.path.join(self.base_log_path, self.signature, "metrics")
+        os.makedirs(metrics_dir, exist_ok=True)
+        metrics_file = os.path.join(metrics_dir, "tool_call_metrics.jsonl")
+        metrics = self._extract_tool_call_metrics(conversation, elapsed_seconds)
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "signature": self.signature,
+            "decision_time": decision_time,
+            "decision_count": decision_count,
+            **metrics,
+        }
+        with open(metrics_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        return log_entry
+
+    def _extract_observation_markdown(self, final_agent_summary: Optional[str]) -> str:
+        """Best-effort extraction for a readable Observation Summary file."""
+        text = str(final_agent_summary or "").strip()
+        if not text:
+            return ""
+        marker = "Observation Summary:"
+        start = text.find(marker)
+        if start < 0:
+            return self._truncate_text(text, 4000)
+        import re
+
+        end_candidates = []
+        for pattern in (
+            r"\n```json\b",
+            r'\n\{\s*"decision_evidence_report"',
+            r'\n\{\s*"benchmark_decision_report"',
+            r"\n\{'CASH'",
+        ):
+            match = re.search(pattern, text[start:], flags=re.IGNORECASE)
+            if match:
+                end_candidates.append(start + match.start())
+        end = min(end_candidates) if end_candidates else len(text)
+        return text[start:end].strip()
+
+    def _write_decision_run_artifacts(
+        self,
+        *,
+        today_date: str,
+        decision_time: str,
+        decision_count: int,
+        input_payload: Dict[str, Any],
+        full_conversation_entry: Optional[Dict[str, Any]],
+        tool_metrics_entry: Optional[Dict[str, Any]],
+        report_log_entry: Optional[Dict[str, Any]],
+        final_agent_summary: Optional[str],
+        tool_summary: str,
+        collected_tool_errors: List[str],
+        handled_trading_result: bool,
+    ) -> None:
+        """Write split files and a concise Markdown view without replacing raw logs."""
+        run_dir = self._run_artifact_dir(today_date, decision_time)
+
+        def write_json(filename: str, payload: Any) -> None:
+            with open(os.path.join(run_dir, filename), "w", encoding="utf-8") as f:
+                json.dump(self._to_jsonable(payload), f, ensure_ascii=False, indent=2)
+                f.write("\n")
+
+        write_json("input.json", input_payload)
+        messages = (full_conversation_entry or {}).get("messages") or []
+        with open(os.path.join(run_dir, "conversation.jsonl"), "w", encoding="utf-8") as f:
+            for message in messages:
+                f.write(json.dumps(message, ensure_ascii=False) + "\n")
+
+        observation_md = self._extract_observation_markdown(final_agent_summary)
+        with open(os.path.join(run_dir, "observation.md"), "w", encoding="utf-8") as f:
+            f.write(observation_md or "(no observation summary captured)")
+            f.write("\n")
+
+        write_json("decision_report.json", report_log_entry or {})
+        tool_calls = (tool_metrics_entry or {}).get("calls") or []
+        with open(os.path.join(run_dir, "tool_calls.jsonl"), "w", encoding="utf-8") as f:
+            for call in tool_calls:
+                f.write(json.dumps(call, ensure_ascii=False) + "\n")
+
+        report = (report_log_entry or {}).get("report") or {}
+        actions = report.get("actions_planned_or_taken") if isinstance(report, dict) else []
+        execution = {
+            "signature": self.signature,
+            "decision_time": decision_time,
+            "decision_count": decision_count,
+            "handled_trading_result": handled_trading_result,
+            "actions_planned_or_taken": actions if isinstance(actions, list) else [],
+            "tool_summary": tool_summary,
+            "tool_errors": list(dict.fromkeys(msg for msg in collected_tool_errors if msg)),
+            "parse_success": (report_log_entry or {}).get("parse_success"),
+            "schema_valid": (report_log_entry or {}).get("schema_valid"),
+        }
+        write_json("execution.json", execution)
+
+        snapshot_compact = input_payload.get("snapshot_compact") or {}
+        snapshot_news = snapshot_compact.get("news") if isinstance(snapshot_compact, dict) else {}
+        snapshot_prices = snapshot_compact.get("prices") if isinstance(snapshot_compact, dict) else {}
+        snapshot_indicators = snapshot_compact.get("indicators") if isinstance(snapshot_compact, dict) else {}
+        news_symbols = len(snapshot_news) if isinstance(snapshot_news, dict) else 0
+        news_items = 0
+        if isinstance(snapshot_news, dict):
+            for payload in snapshot_news.values():
+                if isinstance(payload, dict):
+                    news_items += int(payload.get("count") or len(payload.get("news") or []) or 0)
+        price_symbols = len(snapshot_prices) if isinstance(snapshot_prices, dict) else 0
+        indicator_symbols = len(snapshot_indicators) if isinstance(snapshot_indicators, dict) else 0
+
+        action_lines: List[str] = []
+        for action in execution["actions_planned_or_taken"]:
+            if not isinstance(action, dict):
+                continue
+            action_name = action.get("action", "unknown")
+            symbol = action.get("symbol") or ""
+            amount = action.get("amount")
+            reason = self._truncate_text(str(action.get("reason_text") or ""), 360)
+            suffix = f" {symbol}" if symbol else ""
+            if amount not in (None, "", 0):
+                suffix += f" x{amount}"
+            action_lines.append(f"- `{action_name}`{suffix}: {reason}")
+        if not action_lines:
+            action_lines.append("- (no structured action captured)")
+
+        by_tool = (tool_metrics_entry or {}).get("by_tool") or {}
+        if by_tool:
+            tool_lines = [
+                f"- `{name}`: count={stats.get('count', 0)}, success={stats.get('success', 0)}, failed={stats.get('failed', 0)}, unknown={stats.get('unknown', 0)}"
+                for name, stats in by_tool.items()
+                if isinstance(stats, dict)
+            ]
+        else:
+            tool_lines = ["- No tool calls"]
+
+        report_status = (
+            f"parse_success={execution['parse_success']}, "
+            f"schema_valid={execution['schema_valid']}"
+        )
+        snapshot_info = input_payload.get("snapshot") or {}
+        readable = [
+            f"# {self.signature} | {decision_time}",
+            "",
+            "> 摘要视图：完整原始输入、完整对话和结构化报告分别见 `input.json`、`conversation.jsonl`、`decision_report.json`。",
+            "",
+            "## Input",
+            f"- Decision: {decision_count}/3",
+            f"- Snapshot: `{snapshot_info.get('snapshot_path', 'unknown')}`",
+            f"- Cash: {input_payload.get('cash')}",
+            f"- Realized equity: {input_payload.get('realized_equity')}",
+            f"- Unrealized equity: {input_payload.get('unrealized_equity', input_payload.get('total_equity'))}",
+            f"- Position cost: {input_payload.get('position_cost')}",
+            "",
+            "## Snapshot Health",
+            f"- News symbols: {news_symbols}; news items: {news_items}",
+            f"- Price symbols: {price_symbols}",
+            f"- Indicator symbols: {indicator_symbols}",
+            "",
+            "## Observation",
+            observation_md or "(no observation summary captured)",
+            "",
+            "## Tool Calls",
+            "\n".join(tool_lines),
+            "",
+            "## Decision",
+            "\n".join(action_lines),
+            "",
+            "## Execution",
+            f"- Trading result handled: {handled_trading_result}",
+            f"- Report status: {report_status}",
+        ]
+        if execution["tool_errors"]:
+            readable.extend(["- Tool/errors:", "\n".join(f"  - {err}" for err in execution["tool_errors"])])
+        with open(os.path.join(run_dir, "readable.md"), "w", encoding="utf-8") as f:
+            f.write("\n".join(readable).rstrip() + "\n")
+
+        purposes = {
+            "input.json": "完整决策输入与 compact snapshot",
+            "conversation.jsonl": "完整模型/工具对话原文，不截断",
+            "observation.md": "可读 Observation Summary 摘要",
+            "decision_report.json": "结构化 decision_evidence_report 解析结果",
+            "tool_calls.jsonl": "工具调用指标明细",
+            "execution.json": "本轮执行状态、动作和错误摘要",
+            "readable.md": "人工可读摘要视图，可能截断长文本",
+        }
+        manifest = {
+            "signature": self.signature,
+            "decision_time": decision_time,
+            "decision_count": decision_count,
+            "created_at": datetime.now().isoformat(),
+            "artifacts": [],
+        }
+        for filename in sorted(os.listdir(run_dir)):
+            if filename == "artifact_manifest.json":
+                continue
+            path = os.path.join(run_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            manifest["artifacts"].append({
+                "filename": filename,
+                "path": path,
+                "size_bytes": os.path.getsize(path),
+                "complete_raw": filename in ("input.json", "conversation.jsonl", "decision_report.json"),
+                "summary_view": filename in ("readable.md", "observation.md"),
+                "purpose": purposes.get(filename, "运行产物"),
+            })
+        write_json("artifact_manifest.json", manifest)
 
     def _log_snapshot_reference(
         self,
@@ -2753,6 +4262,99 @@ class AgenticWorkflow:
             sanitized["symbol"] = sanitized["symbol"].apply(self._normalize_symbol_value)
             sanitized = sanitized[sanitized["symbol"].astype(str).str.len() > 0]
         return sanitized
+
+    def _to_optional_float(self, value: Any) -> Optional[float]:
+        try:
+            if value is None or pd.isna(value):
+                return None
+        except Exception:
+            pass
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _calculate_sma_5_vs_20_pct(self, df: pd.DataFrame, anchor_dt: Optional[pd.Timestamp]) -> Optional[float]:
+        if df is None or df.empty or "close" not in df.columns:
+            return None
+        scoped = df.copy()
+        if anchor_dt is not None and not pd.isna(anchor_dt):
+            scoped = scoped[scoped.index <= anchor_dt]
+        closes = pd.to_numeric(scoped["close"], errors="coerce").dropna()
+        if len(closes) < 20:
+            return None
+        sma_5 = float(closes.tail(5).mean())
+        sma_20 = float(closes.tail(20).mean())
+        if sma_20 == 0:
+            return None
+        return round(((sma_5 / sma_20) - 1.0) * 100.0, 4)
+
+    def _calculate_max_drawdown_pct(
+        self,
+        df: pd.DataFrame,
+        today_obj: Optional[Any],
+        anchor_dt: Optional[pd.Timestamp],
+        window_days: int = 5,
+    ) -> Optional[float]:
+        if df is None or df.empty or "close" not in df.columns:
+            return None
+        scoped = df.copy()
+        if anchor_dt is not None and not pd.isna(anchor_dt):
+            scoped = scoped[scoped.index <= anchor_dt]
+        unique_dates = sorted({ts.date() for ts in scoped.index if isinstance(ts, datetime)})
+        if today_obj is not None:
+            unique_dates = [d for d in unique_dates if d <= today_obj]
+        selected_dates = unique_dates[-window_days:]
+        if not selected_dates:
+            return None
+        index_dates = pd.Series(scoped.index, index=scoped.index).apply(
+            lambda ts: ts.date() if isinstance(ts, datetime) else None
+        )
+        window_df = scoped[index_dates.isin(selected_dates)]
+        closes = pd.to_numeric(window_df["close"], errors="coerce").dropna()
+        if len(closes) < 2:
+            return None
+        running_peak = closes.cummax()
+        drawdowns = (closes / running_peak - 1.0) * 100.0
+        return round(float(drawdowns.min()), 4)
+
+    def _previous_session_close_from_hourly_df(
+        self,
+        df: pd.DataFrame,
+        today_obj: Optional[Any],
+    ) -> Optional[float]:
+        if df is None or df.empty or today_obj is None or "close" not in df.columns:
+            return None
+        prev_dates = sorted({ts.date() for ts in df.index if isinstance(ts, datetime) and ts.date() < today_obj})
+        if not prev_dates:
+            return None
+        prev_day_df = df[df.index.date == prev_dates[-1]]
+        if prev_day_df.empty:
+            return None
+        return self._to_optional_float(prev_day_df["close"].iloc[-1])
+
+    def _build_microstructure_flags(
+        self,
+        price: Optional[float],
+        limit_info: Optional[Dict[str, Any]],
+    ) -> Dict[str, bool]:
+        if price is None or not limit_info:
+            return {
+                "hit_limit_up": False,
+                "hit_limit_down": False,
+                "near_limit_up": False,
+                "near_limit_down": False,
+            }
+        upper = self._to_optional_float(limit_info.get("upper"))
+        lower = self._to_optional_float(limit_info.get("lower"))
+        hit_threshold = self.LIMIT_THRESHOLD_RATIO
+        near_threshold = 0.98
+        return {
+            "hit_limit_up": bool(upper is not None and price >= upper * hit_threshold),
+            "hit_limit_down": bool(lower is not None and price <= lower / hit_threshold),
+            "near_limit_up": bool(upper is not None and price >= upper * near_threshold),
+            "near_limit_down": bool(lower is not None and price <= lower / near_threshold),
+        }
     
     def _get_previous_close(self, symbol: str, today_date: str) -> Optional[float]:
         if not self.dm:
@@ -2781,11 +4383,15 @@ class AgenticWorkflow:
         if action == "buy":
             upper = limits.get("upper")
             if upper is not None and price >= upper * threshold:
+                return False, f"Trade_Failed: Limit_Up_Restriction - 已触及涨停价 ¥{upper:.2f}，买入流动性锁定，订单不成交。"
+            if upper is not None and price >= upper * 0.98:
                 if random.random() >= self.LIMIT_ORDER_SUCCESS_RATE:
                     return False, f"接近涨停价 ¥{upper:.2f}，买单成交概率仅10%，此次模拟未成交。"
         elif action == "sell":
             lower = limits.get("lower")
             if lower is not None and price <= lower / threshold:
+                return False, f"Trade_Failed: Limit_Down_Restriction - 已触及跌停价 ¥{lower:.2f}，卖出流动性锁定，订单不成交。"
+            if lower is not None and price <= lower / 0.98:
                 if random.random() >= self.LIMIT_ORDER_SUCCESS_RATE:
                     return False, f"接近跌停价 ¥{lower:.2f}，卖单成交概率仅10%，此次模拟未成交。"
         return True, None
@@ -2843,9 +4449,9 @@ class AgenticWorkflow:
             shares = item["shares"]
             purchase_date = item.get("purchase_date")
             avg_price = item.get("avg_price")
-            current_price = None
+            current_price = self._get_snapshot_price(normalize_symbol(symbol) or symbol)
             if price_lookup:
-                current_price = price_lookup.get(symbol.upper()) or price_lookup.get(symbol)
+                current_price = current_price or price_lookup.get(symbol.upper()) or price_lookup.get(symbol)
             if current_price is None and self.dm:
                 try:
                     current_price = self.dm.get_price_at(symbol, target_time)
@@ -3052,17 +4658,34 @@ class AgenticWorkflow:
             stage = "afternoon (adjust/lock profits)"
 
         metrics = self._compute_portfolio_metrics(latest_positions, today_date, current_time)
+        position_cost_basis = 0.0
+        for holding in metrics.get("holdings", []):
+            try:
+                shares_for_cost = float(holding.get("shares") or 0)
+                avg_for_cost = holding.get("avg_price")
+                if avg_for_cost is not None:
+                    position_cost_basis += shares_for_cost * float(avg_for_cost)
+            except Exception:
+                continue
+        realized_equity = metrics["cash"] + position_cost_basis
+        unrealized_equity = metrics["total_equity"]
         if metrics["cash"] <= 0 and not metrics["holdings"]:
             print("⚠️ Cash balance is zero with no holdings. Consider enabling FORCE_REPLAY to reset positions.")
         holdings_lines: List[str] = []
         for holding in metrics.get("holdings", []):
             sym = holding["symbol"]
             shares = holding["shares"]
+            position_entry = latest_positions.get(sym, {}) if isinstance(latest_positions, dict) else {}
+            available_to_sell = get_available_sell_shares(position_entry, today_date) if isinstance(position_entry, dict) else 0
+            locked_today = max(int(shares or 0) - int(available_to_sell or 0), 0)
             avg_price = holding.get("avg_price")
             current_price = holding.get("current_price")
             market_value = holding.get("market_value", 0.0)
             unrealized = holding.get("unrealized")
-            line = f"  • {sym}: {shares} shares"
+            line = (
+                f"  • {sym}: total={shares} shares, "
+                f"available_to_sell={available_to_sell}, locked_today={locked_today}"
+            )
             if current_price is not None:
                 line += f", Px ¥{current_price:,.2f}"
             if avg_price is not None:
@@ -3074,9 +4697,8 @@ class AgenticWorkflow:
         if not holdings_lines:
             holdings_lines.append("  • (no equity positions)")
 
-        # 永远给 LLM 全量数据，让它自己做观察总结（每个模型输出会不同）
-        snapshot_for_llm = copy.deepcopy(snapshot_bundle or {})
-        snapshot_for_llm.pop("observation_summary", None)  # 避免把程序生成的摘要塞给模型
+        # 给 LLM 精简快照；完整小时线等重数据留在工具缓存中按需查询。
+        snapshot_for_llm = self._compact_snapshot_for_llm(snapshot_bundle or {})
         snapshot_json_compact = json.dumps(snapshot_for_llm, ensure_ascii=False, separators=(",", ":"))
         required_symbols = ", ".join(self.stock_symbols)
         
@@ -3084,27 +4706,30 @@ class AgenticWorkflow:
         observation_block = (
             "【任务步骤1】请先分析以下市场数据并生成 Observation Summary：\n\n"
             "数据说明（已预处理好）：\n"
-            "  - 以下JSON包含 news/prices/indicators 等市场数据\n"
-            "  - 新闻数据：当天 + 过去2天（共3天），只使用 title；已过滤到 <= current_time\n"
-            "  - 价格/技术指标：共3天，对齐到当前决策时刻；只关注 RSI_3 与 MACD_12_26_9（不使用 OBV）\n"
+            "  - 以下JSON包含精简的 news/prices/indicators 决策数据\n"
+            "  - 新闻数据：默认展示近30天较短标题列表；如需更长新闻窗口，可调用 search_stock_news\n"
+            "  - 价格/技术指标：包含3天决策时点摘要，以及客观 price_indicators: momentum(RSI_3/MACD_12_26_9), trend(SMA_5_vs_20_pct), risk(MAX_DRAWDOWN_5D), microstructure(hit/near limit flags)。真实60分钟K线未内嵌，如需查看可调用 get_hourly_stock_data\n"
+            "  - RSI_3 是短周期触发/警报信号，不是单独决策依据；如动量与趋势/风险冲突，请说明该冲突如何影响决策。\n"
             "\n"
             "请立即执行：生成【Observation Summary】，格式如下：\n"
             "```\n"
             "Observation Summary:\n"
             "\n"
             f"1. {self.stock_symbols[0] if self.stock_symbols else 'SH688008'}\n"
-            "   - 技术指标: RSI_3=XX, MACD_12_26_9=XX (简要分析)\n"
+            "   - 技术指标: RSI_3=XX, MACD_12_26_9=XX, SMA_5_vs_20_pct=XX, MAX_DRAWDOWN_5D=XX (简要分析)\n"
+            "   - 微观结构: hit_limit_up/down=..., near_limit_up/down=...\n"
             "   - 新闻: [总结新闻标题的影响，若无新闻写\"无相关新闻\"]\n"
             "\n"
             f"2. {self.stock_symbols[1] if len(self.stock_symbols) > 1 else 'SH688111'}\n"
-            "   - 技术指标: RSI_3=XX, MACD_12_26_9=XX (简要分析)\n"
+            "   - 技术指标: RSI_3=XX, MACD_12_26_9=XX, SMA_5_vs_20_pct=XX, MAX_DRAWDOWN_5D=XX (简要分析)\n"
+            "   - 微观结构: hit_limit_up/down=..., near_limit_up/down=...\n"
             "   - 新闻: [总结新闻标题的影响，若无新闻写\"无相关新闻\"]\n"
             "\n"
             "... (必须覆盖所有股票)\n"
             "```\n"
             "\n"
             f"【必须覆盖】以下全部股票（按顺序，不可遗漏）：{required_symbols}\n"
-            "  ✓ 每只股票必须包含：技术指标分析（RSI_3、MACD_12_26_9的具体数值和简要判断）+ 新闻影响分析\n"
+            "  ✓ 每只股票必须包含：技术指标分析（RSI_3、MACD_12_26_9、SMA_5_vs_20_pct、MAX_DRAWDOWN_5D的具体数值和简要判断）+ 微观结构 + 新闻影响分析\n"
             "  ✓ 若某只股票在 JSON 中缺少数据：必须说明缺失的是 prices / indicators / news 中的哪一块\n"
             "  ✓ 必须按照上述格式，逐只股票列出，不能合并或省略\n"
             "\n"
@@ -3129,26 +4754,73 @@ class AgenticWorkflow:
             "【执行要求】\n"
             "请严格按照observation_block中的要求执行任务，不要复述输入内容。必须：\n"
             "1. 生成Observation Summary（覆盖所有股票）\n"
-            "2. 基于分析进行交易决策\n"
-            "3. 使用 <FINISH_SIGNAL> 结束"
+            "2. 基于分析进行交易决策；BUY、SELL、HOLD、active waiting/no_trade 同等有效，不要为了活跃而交易。\n"
+            "3. 输出一个合法 fenced JSON block，顶层必须包含 decision_evidence_report，schema_version 必须为 2。该 JSON 必须包含 observed_universe、candidate_review、actions_planned_or_taken、workflow_trace。\n"
+            "4. candidate_review 只记录你当时使用的证据：新闻标题/发布时间/来源/你的解释、价格指标、signal_evaluation、风险检查、买入或拒绝理由。不要输出 Fin-SNR Failure、Top3、hit/miss、news-conflict failure、overheated-positive-news failure、weak-reason loss 等事后结论。\n"
+            "5. actions_planned_or_taken 只记录实际计划或已执行动作，以及动作理由和链接的证据标题；如果不交易，也必须写一条 no_trade 动作和 reason_text，并引用至少2个具体数据点作为主动观望依据。\n"
+            "6. 若考虑 SELL，必须先使用 Holdings detail 中的 available_to_sell，而不是 total shares；locked_today 不可卖。\n"
+            f"7. 使用 {STOP_SIGNAL} 结束"
         )
 
         user_query = [{"role": "user", "content": context_message}]
         message = user_query.copy()
+        run_input_payload = {
+            "signature": self.signature,
+            "today_date": today_date,
+            "decision_time": current_time,
+            "decision_count": decision_count,
+            "stage": stage,
+            "latest_recorded_action": last_action,
+            "cash": metrics["cash"],
+            "position_value": metrics["position_value"],
+            "position_cost": position_cost_basis,
+            "realized_equity": realized_equity,
+            "unrealized_equity": unrealized_equity,
+            "total_equity": metrics["total_equity"],
+            "unrealized_pnl": metrics["unrealized_total"],
+            "holdings_detail": holdings_lines,
+            "symbols": list(self.stock_symbols),
+            "snapshot": self._to_jsonable(self._current_snapshot_info or {}),
+            "snapshot_compact": snapshot_for_llm,
+            "positions": latest_positions,
+            "positions_json": positions_json,
+            "context_message": context_message,
+        }
         
         # Log initial message
         self._log_message(log_file, user_query, decision_time=current_time, decision_count=decision_count)
         
         final_agent_summary: Optional[str] = None
         collected_tool_errors: List[str] = []
+        report_log_entry: Optional[Dict[str, Any]] = None
+        full_conversation_entry: Optional[Dict[str, Any]] = None
+        tool_metrics_entry: Optional[Dict[str, Any]] = None
+        tool_summary = "(no tool output)"
+        should_handle_trading_result = True
+        handled_trading_result = False
         
         try:
+            invoke_started_at = time.perf_counter()
             response = await self._ainvoke_with_retry(message, recursion_limit=self.max_steps)
+            invoke_elapsed = time.perf_counter() - invoke_started_at
+            full_conversation_entry = self._log_full_conversation(
+                log_file,
+                response,
+                decision_time=current_time,
+                decision_count=decision_count,
+            )
+            tool_metrics_entry = self._log_tool_call_metrics(
+                response,
+                elapsed_seconds=invoke_elapsed,
+                decision_time=current_time,
+                decision_count=decision_count,
+            )
             
             # Extract agentic workflow response
             agent_response = extract_llm_conversation(response, "final")
             if agent_response and agent_response.strip():
                 final_agent_summary = agent_response
+                report_content = self._latest_decision_report_content_from_conversation(response) or agent_response
                 if STOP_SIGNAL in agent_response:
                     print("✅ Received stop signal, trading session ended")
                 else:
@@ -3158,6 +4830,12 @@ class AgenticWorkflow:
                 self._log_message(
                     log_file,
                     [{"role": "assistant", "content": agent_response}],
+                    decision_time=current_time,
+                    decision_count=decision_count,
+                )
+                report_log_entry = self._log_benchmark_decision_report(
+                    log_file,
+                    report_content,
                     decision_time=current_time,
                     decision_count=decision_count,
                 )
@@ -3171,11 +4849,16 @@ class AgenticWorkflow:
                     decision_time=current_time,
                     decision_count=decision_count,
                 )
+                report_log_entry = self._log_benchmark_decision_report(
+                    log_file,
+                    None,
+                    decision_time=current_time,
+                    decision_count=decision_count,
+                )
 
             # Extract and summarize tool outputs for logging/error tracking
             tool_msgs = extract_llm_tool_messages(response)
             tool_response = self._combine_tool_outputs(tool_msgs)
-            tool_summary = "(no tool output)"
             if tool_response:
                 collected_tool_errors.extend(self._extract_tool_errors(tool_response))
                 tool_summary = self._summarize_content(tool_response) or self._truncate_text(tool_response, 600)
@@ -3185,6 +4868,23 @@ class AgenticWorkflow:
                 decision_time=current_time,
                 decision_count=decision_count,
             )
+            if report_log_entry and (
+                not report_log_entry.get("parse_success")
+                or not report_log_entry.get("schema_valid")
+            ):
+                reason = (
+                    f"decision_evidence_report invalid: parse_success={report_log_entry.get('parse_success')}, "
+                    f"schema_valid={report_log_entry.get('schema_valid')}, "
+                    f"parse_error={report_log_entry.get('parse_error')}, "
+                    f"missing={report_log_entry.get('missing_required_sections')}"
+                )
+                if get_runtime_config_value("IF_TRADE"):
+                    # Do not retry after a side-effecting trade tool already ran; that could duplicate orders.
+                    print(f"⚠️ {reason}; trade already executed, not retrying this decision point.")
+                    collected_tool_errors.append(reason)
+                else:
+                    should_handle_trading_result = False
+                    raise DecisionEvidenceReportError(reason)
         except Exception as e:
             print(f"❌ Trading session error: {str(e)}")
             print(f"Error details: {e}")
@@ -3205,27 +4905,47 @@ class AgenticWorkflow:
             raise
         finally:
             # 无论成功与否都尝试处理交易结果并记录状态
+            if should_handle_trading_result:
+                try:
+                    await self._handle_trading_result(
+                        today_date,
+                        current_time,
+                        decision_count,
+                        log_file,
+                        final_agent_summary,
+                        collected_tool_errors,
+                    )
+                    handled_trading_result = True
+                except Exception as e:
+                    print(f"⚠️ Error handling trading result: {e}")
+                    try:
+                        error_msg = f"Error handling trading result: {str(e)}"
+                        self._log_message(
+                            log_file,
+                            [{"role": "system", "content": error_msg}],
+                            decision_time=current_time,
+                            decision_count=decision_count,
+                        )
+                    except Exception:
+                        pass
+            else:
+                print("↻ Skipping position/no-trade write for retryable invalid decision report.")
             try:
-                await self._handle_trading_result(
-                    today_date,
-                    current_time,
-                    decision_count,
-                    log_file,
-                    final_agent_summary,
-                    collected_tool_errors,
+                self._write_decision_run_artifacts(
+                    today_date=today_date,
+                    decision_time=current_time,
+                    decision_count=decision_count,
+                    input_payload=run_input_payload,
+                    full_conversation_entry=full_conversation_entry,
+                    tool_metrics_entry=tool_metrics_entry,
+                    report_log_entry=report_log_entry,
+                    final_agent_summary=final_agent_summary,
+                    tool_summary=tool_summary,
+                    collected_tool_errors=collected_tool_errors,
+                    handled_trading_result=handled_trading_result,
                 )
             except Exception as e:
-                print(f"⚠️ Error handling trading result: {e}")
-                try:
-                    error_msg = f"Error handling trading result: {str(e)}"
-                    self._log_message(
-                        log_file,
-                        [{"role": "system", "content": error_msg}],
-                        decision_time=current_time,
-                        decision_count=decision_count,
-                    )
-                except Exception:
-                    pass
+                print(f"⚠️ Error writing readable run artifacts: {e}")
             try:
                 from utils.backup_utils import run_backup_snapshot, save_pnl_snapshot
                 # Windows 文件名清理：将时间中的冒号和空格替换为连字符和下划线

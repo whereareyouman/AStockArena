@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -157,20 +158,18 @@ class SharedPrefetchCoordinator:
 
     def _decision_key(self, today_date: str, current_time: str, symbols_signature: str) -> str:
         sanitized_time = current_time.replace(":", "-").replace(" ", "_")
-        # Windows 文件名字符清理：替换无效字符（|, <, >, :, ", /, \, ?, *）为下划线
-        safe_signature = symbols_signature.replace("|", "_").replace("<", "_").replace(">", "_").replace(":", "_").replace('"', "_").replace("/", "_").replace("\\", "_").replace("?", "_").replace("*", "_")
-        return f"{today_date}_{sanitized_time}_{safe_signature}"
+        return f"{today_date}_{sanitized_time}_{self._signature_digest(symbols_signature)}"
+
+    def _signature_digest(self, symbols_signature: str) -> str:
+        digest = hashlib.sha256((symbols_signature or "").encode("utf-8")).hexdigest()[:16]
+        return f"sig-{digest}"
 
     def _snapshot_path(self, today_date: str, current_time: str, symbols_signature: str) -> Path:
         sanitized_time = current_time.replace(":", "-").replace(" ", "_")
-        # Windows 文件名字符清理：替换无效字符为下划线
-        safe_signature = symbols_signature.replace("|", "_").replace("<", "_").replace(">", "_").replace(":", "_").replace('"', "_").replace("/", "_").replace("\\", "_").replace("?", "_").replace("*", "_")
-        return self.snapshots_dir / today_date / f"{sanitized_time}_{safe_signature}.json"
+        return self.snapshots_dir / today_date / f"{sanitized_time}_{self._signature_digest(symbols_signature)}.json"
 
     def _lock_path(self, key: str) -> Path:
-        # 确保 key 中不包含 Windows 无效字符
-        safe_key = key.replace("|", "_").replace("<", "_").replace(">", "_").replace(":", "_").replace('"', "_").replace("/", "_").replace("\\", "_").replace("?", "_").replace("*", "_")
-        return self.lock_dir / f"{safe_key}.lock"
+        return self.lock_dir / f"{key}.lock"
 
     def _is_fresh(self, payload: Dict[str, Any], today_date: str, current_time: str, symbols_signature: str) -> bool:
         if not payload:
@@ -217,9 +216,12 @@ class SharedPrefetchCoordinator:
             # 如果新格式不存在，尝试旧格式（使用原始 | 分隔符，兼容旧文件）
             sanitized_time = current_time.replace(":", "-").replace(" ", "_")
             old_format_path = self.snapshots_dir / today_date / f"{sanitized_time}_{symbols_signature}.json"
-            if old_format_path.exists():
-                snapshot_path = old_format_path
-            else:
+            try:
+                if old_format_path.exists():
+                    snapshot_path = old_format_path
+                else:
+                    return None
+            except OSError:
                 return None
         
         payload = self.json_manager.safe_read_json(str(snapshot_path), default={})
