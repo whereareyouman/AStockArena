@@ -46,6 +46,7 @@ from utils.position_manager import normalize_symbol
 
 DEFAULT_DECISION_TIMES = ("10:30:00", "11:30:00", "14:00:00")
 DEFAULT_RETRY_BACKOFF = (5.0, 30.0, 120.0)
+TERMINAL_EVENT_STATUSES = {"succeeded", "partial_failed", "failed", "skipped"}
 STATE_DIR = PROJECT_ROOT / "jobs" / "live_scheduler"
 STATE_PATH = STATE_DIR / "state.json"
 HEARTBEAT_PATH = STATE_DIR / "heartbeat.json"
@@ -274,7 +275,7 @@ def mark_missed_events(config: Dict[str, Any], state: Dict[str, Any], now: Optio
     for event in iter_future_events(config, start_of_day, max_days=0):
         if event.target_dt + timedelta(minutes=catchup_minutes) >= now:
             continue
-        if events.get(event.key, {}).get("status") in ("succeeded", "skipped"):
+        if events.get(event.key, {}).get("status") in TERMINAL_EVENT_STATUSES:
             continue
         events[event.key] = {
             **events.get(event.key, {}),
@@ -295,7 +296,7 @@ def next_pending_event(config: Dict[str, Any], state: Dict[str, Any], now: Optio
     events = state.setdefault("events", {})
     for event in iter_future_events(config, now, max_days=35):
         status = events.get(event.key, {}).get("status")
-        if status == "succeeded":
+        if status in TERMINAL_EVENT_STATUSES:
             continue
         if event.target_dt + timedelta(minutes=catchup_minutes) < now:
             continue
@@ -523,6 +524,9 @@ def _write_tick_config(config: Dict[str, Any], event: DecisionEvent, signature: 
 
 def prefetch_news_for_event(config: Dict[str, Any], event: DecisionEvent) -> bool:
     run_config = config.get("run_config", {})
+    if _truthy(os.getenv("ASTOCK_SKIP_EVENT_NEWS_PREFETCH"), default=False):
+        print("News prefetch skipped by ASTOCK_SKIP_EVENT_NEWS_PREFETCH=1", flush=True)
+        return True
     if not _truthy(run_config.get("live_prefetch_news_before_decision"), default=True):
         print("News prefetch skipped by live_prefetch_news_before_decision=false", flush=True)
         return True
@@ -792,6 +796,147 @@ def _latest_agent_run(signature: str, event: DecisionEvent) -> Optional[Path]:
     return None
 
 
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _position_records(signature: str) -> List[Dict[str, Any]]:
+    path = PROJECT_ROOT / "data_flow" / "trading_summary_each_agent" / signature / "position" / "position.jsonl"
+    if not path.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+    except Exception:
+        return []
+    return records
+
+
+def _latest_position_record(signature: str, event: DecisionEvent) -> Dict[str, Any]:
+    selected: Dict[str, Any] = {}
+    for record in _position_records(signature):
+            if record.get("date") != event.date:
+                continue
+            if record.get("decision_time") != event.decision_time:
+                continue
+            if record.get("decision_count") not in (None, event.decision_count):
+                continue
+            selected = record
+    return selected
+
+
+def _snapshot_prices(event_state: Dict[str, Any]) -> Dict[str, float]:
+    snapshot_info = event_state.get("snapshot") if isinstance(event_state, dict) else {}
+    snapshot_path = ""
+    if isinstance(snapshot_info, dict):
+        snapshot_path = str(snapshot_info.get("path") or "")
+    payload = _read_json(Path(snapshot_path), {}) if snapshot_path else {}
+    raw_prices = payload.get("prices") if isinstance(payload, dict) else {}
+    prices: Dict[str, float] = {}
+    if not isinstance(raw_prices, dict):
+        return prices
+    for symbol, value in raw_prices.items():
+        normalized = normalize_symbol(symbol)
+        price: Optional[float] = None
+        if isinstance(value, dict):
+            for key in ("current_price", "price", "last_price", "close", "latest_price"):
+                price = _float_or_none(value.get(key))
+                if price is not None:
+                    break
+        else:
+            price = _float_or_none(value)
+        if normalized and price is not None:
+            prices[normalized] = price
+    return prices
+
+
+def _position_equity_fields(position_record: Dict[str, Any], prices: Dict[str, float]) -> Dict[str, float]:
+    positions = position_record.get("positions") if isinstance(position_record, dict) else {}
+    if not isinstance(positions, dict):
+        return {}
+    cash = _float_or_none(positions.get("CASH")) or 0.0
+    cost_value = 0.0
+    market_value = 0.0
+    for symbol, payload in positions.items():
+        if symbol == "CASH" or not isinstance(payload, dict):
+            continue
+        shares = _float_or_none(payload.get("shares")) or 0.0
+        avg_price = _float_or_none(payload.get("avg_price")) or 0.0
+        normalized = normalize_symbol(symbol)
+        mark_price = prices.get(normalized) if normalized else None
+        if mark_price is None:
+            mark_price = avg_price
+        cost_value += shares * avg_price
+        market_value += shares * mark_price
+    return {
+        "cash": round(cash, 4),
+        "realized": round(cash + cost_value, 4),
+        "unrealized": round(cash + market_value, 4),
+    }
+
+
+def _share_map(position_record: Dict[str, Any]) -> Dict[str, float]:
+    positions = position_record.get("positions") if isinstance(position_record, dict) else {}
+    if not isinstance(positions, dict):
+        return {}
+    shares: Dict[str, float] = {}
+    for symbol, payload in positions.items():
+        if symbol == "CASH" or not isinstance(payload, dict):
+            continue
+        normalized = normalize_symbol(symbol)
+        amount = _float_or_none(payload.get("shares"))
+        if normalized and amount is not None:
+            shares[normalized] = amount
+    return shares
+
+
+def _actual_action_text(signature: str, event: DecisionEvent, selected: Dict[str, Any]) -> str:
+    if not selected:
+        return ""
+    records = _position_records(signature)
+    previous: Dict[str, Any] = {}
+    for record in records:
+        if record is selected:
+            break
+        if record.get("date") == selected.get("date") and record.get("decision_time") == selected.get("decision_time") and record.get("id") == selected.get("id"):
+            break
+        previous = record
+    before = _share_map(previous)
+    after = _share_map(selected)
+    actions: List[str] = []
+    for symbol in sorted(set(before) | set(after)):
+        delta = (after.get(symbol) or 0.0) - (before.get(symbol) or 0.0)
+        if abs(delta) < 1e-9:
+            continue
+        verb = "buy" if delta > 0 else "sell"
+        amount = abs(delta)
+        amount_text = str(int(amount)) if float(amount).is_integer() else str(round(amount, 4))
+        actions.append(f"{verb} {symbol} {amount_text}")
+    if actions:
+        return "; ".join(actions)
+    action = selected.get("this_action") if isinstance(selected, dict) else {}
+    if isinstance(action, dict):
+        verb = str(action.get("action") or "").strip()
+        symbol = str(action.get("symbol") or "").strip()
+        amount = action.get("amount")
+        if verb and verb != "seed":
+            return f"{verb} {symbol} {amount or ''}".strip()
+    return "no_trade"
+
+
 def write_daily_summary(config: Dict[str, Any], date_str: str, state: Dict[str, Any]) -> Path:
     out_dir = STATE_DIR / date_str
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -808,13 +953,15 @@ def write_daily_summary(config: Dict[str, Any], date_str: str, state: Dict[str, 
         if not isinstance(event_state, dict) or event_state.get("date") != date_str:
             continue
         decision_time = str(event_state.get("decision_time") or "")
+        event = DecisionEvent(date_str, decision_time, int(event_state.get("decision_count") or 0), _now_cn())
+        prices = _snapshot_prices(event_state)
         for signature, model_state in sorted((event_state.get("models") or {}).items()):
             attempts = model_state.get("attempts") or model_state.get("attempt") or ""
             status = model_state.get("status") or ("succeeded" if model_state.get("returncode") == 0 else event_state.get("status", ""))
             error = model_state.get("error_message") or model_state.get("error_dir") or ""
             action_text = ""
             cash = realized = unrealized = schema = ""
-            run_dir = _latest_agent_run(signature, DecisionEvent(date_str, decision_time, int(event_state.get("decision_count") or 0), _now_cn()))
+            run_dir = _latest_agent_run(signature, event)
             if run_dir:
                 execution = _read_json(run_dir / "execution.json", {})
                 input_payload = _read_json(run_dir / "input.json", {})
@@ -824,9 +971,14 @@ def write_daily_summary(config: Dict[str, Any], date_str: str, state: Dict[str, 
                         f"{a.get('action')} {a.get('symbol') or ''} {a.get('amount') or ''}".strip()
                         for a in actions if isinstance(a, dict)
                     )
-                cash = input_payload.get("cash", "")
-                realized = input_payload.get("realized_equity", "")
-                unrealized = input_payload.get("unrealized_equity", input_payload.get("total_equity", ""))
+                position_record = _latest_position_record(signature, event)
+                actual_action = _actual_action_text(signature, event, position_record)
+                if actual_action:
+                    action_text = actual_action
+                position_fields = _position_equity_fields(position_record, prices)
+                cash = position_fields.get("cash", input_payload.get("cash", ""))
+                realized = position_fields.get("realized", input_payload.get("realized_equity", ""))
+                unrealized = position_fields.get("unrealized", input_payload.get("unrealized_equity", input_payload.get("total_equity", "")))
                 schema = f"parse={execution.get('parse_success')}, schema={execution.get('schema_valid')}"
             rows.append(
                 f"| {decision_time} | {signature} | {status} | {attempts} | "
@@ -1051,7 +1203,7 @@ def run_doctor(config_path: Optional[str] = None) -> int:
 
     venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
     checks.append((".venv", venv_python.exists(), str(venv_python)))
-    for module_name in ("pandas", "requests", "langchain", "langgraph"):
+    for module_name in ("pandas", "requests", "langchain", "langgraph", "tushare"):
         checks.append((f"python module {module_name}", importlib.util.find_spec(module_name) is not None, module_name))
     enabled = _enabled_models(config)
     checks.append(("enabled models", bool(enabled), ", ".join(str(m.get("signature")) for m in enabled)))

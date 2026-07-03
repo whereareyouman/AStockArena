@@ -4,6 +4,7 @@ import time
 from dotenv import load_dotenv
 load_dotenv()
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -395,6 +396,26 @@ def get_position_file_path(modelname: str, for_write: bool = False) -> Path:
     return canonical
 
 
+@contextmanager
+def file_transaction_lock(path: Any, suffix: str = ".txn.lock", timeout: float = 0.0):
+    """Lock a full read-calculate-write transaction for an arbitrary file."""
+
+    target = Path(path)
+    os.makedirs(target.parent, exist_ok=True)
+    lock_file = target.with_name(target.name + suffix)
+    with _FileLock(str(lock_file), timeout=timeout):
+        yield
+
+
+@contextmanager
+def position_transaction_lock(modelname: str, timeout: float = 0.0):
+    """Lock a model's full read-calculate-write position transaction."""
+
+    position_file = get_position_file_path(modelname, for_write=True)
+    with file_transaction_lock(position_file, suffix=".txn.lock", timeout=timeout):
+        yield
+
+
 def calculate_previous_trading_date(today_date: str) -> str:
     """
     获取昨日日期，考虑休市日。
@@ -530,10 +551,15 @@ def get_current_position(today_date: str, modelname: str) -> tuple[Dict[str, any
     if max_id_today >= 0:
         return copy.deepcopy(latest_positions_today), max_id_today, latest_record_today
 
-    # 当天没有记录，则回退到上一个交易日
+    # 当天没有记录，则优先回退到上一个工作日；如果该工作日没有记录，
+    # 继续回退到文件中早于 today_date 的最后一条记录。
+    # 这覆盖 A 股节假日/临时休市导致多个自然工作日没有 position 记录的情况。
     prev_date = calculate_previous_trading_date(today_date)
     max_id_prev = -1
     latest_positions_prev: Dict[str, any] = {}
+    latest_record_any_prev: Optional[Dict[str, Any]] = None
+    latest_positions_any_prev: Dict[str, any] = {}
+    latest_any_key: Optional[tuple[str, str, int]] = None
 
     with position_file.open("r", encoding="utf-8") as f:
         for line in f:
@@ -547,15 +573,100 @@ def get_current_position(today_date: str, modelname: str) -> tuple[Dict[str, any
                         max_id_prev = current_id
                         latest_positions_prev = normalize_positions(doc.get("positions", {}))
                         latest_record_prev = copy.deepcopy(doc)
+
+                doc_date = doc.get("date")
+                if doc_date and str(doc_date) < str(today_date):
+                    try:
+                        current_id = int(doc.get("id", -1))
+                    except Exception:
+                        current_id = -1
+                    decision_time = normalize_decision_time(doc_date, doc.get("decision_time"))
+                    key = (str(doc_date), decision_time, current_id)
+                    if latest_any_key is None or key > latest_any_key:
+                        latest_any_key = key
+                        latest_positions_any_prev = normalize_positions(doc.get("positions", {}))
+                        latest_record_any_prev = copy.deepcopy(doc)
             except Exception:
                 continue
 
-    # 如果找不到任何记录（既没有当天的记录，也没有前一个交易日的记录），返回初始现金持仓
-    if max_id_prev < 0 and not latest_positions_prev:
-        initial_cash = _load_initial_cash()
-        return {"CASH": initial_cash}, -1, None
+    if max_id_prev >= 0 or latest_positions_prev:
+        return copy.deepcopy(latest_positions_prev), max_id_prev, latest_record_prev
 
-    return copy.deepcopy(latest_positions_prev), max_id_prev, latest_record_prev
+    if latest_any_key is not None and latest_positions_any_prev:
+        return (
+            copy.deepcopy(latest_positions_any_prev),
+            latest_any_key[2],
+            latest_record_any_prev,
+        )
+
+    # 如果找不到任何记录（既没有当天的记录，也没有任何过去记录），返回初始现金持仓
+    initial_cash = _load_initial_cash()
+    return {"CASH": initial_cash}, -1, None
+
+
+def _normalize_action_payload(action: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(action, dict):
+        return None
+    normalized = copy.deepcopy(action)
+    normalized["action"] = str(normalized.get("action") or "").strip()
+    action_symbol = normalize_symbol(normalized.get("symbol"))
+    normalized["symbol"] = action_symbol or ""
+    return normalized
+
+
+def _actions_from_record(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions = record.get("actions")
+    if isinstance(actions, list):
+        normalized_actions = []
+        for action in actions:
+            normalized = _normalize_action_payload(action)
+            if normalized:
+                normalized_actions.append(normalized)
+        return normalized_actions
+    action = _normalize_action_payload(record.get("this_action"))
+    if action and action.get("action") != "seed":
+        return [action]
+    return []
+
+
+def _fills_from_record(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    fills = record.get("fills")
+    if isinstance(fills, list):
+        normalized_fills = []
+        for fill in fills:
+            normalized = _normalize_action_payload(fill)
+            if normalized and normalized.get("action") in {"buy", "sell"}:
+                normalized_fills.append(normalized)
+        return normalized_fills
+    action = _normalize_action_payload(record.get("this_action"))
+    if action and action.get("action") in {"buy", "sell"}:
+        return [action]
+    return []
+
+
+def _summarize_record_action(actions: List[Dict[str, Any]], fills: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(fills) == 1:
+        fill = fills[0]
+        return {
+            "action": fill.get("action"),
+            "symbol": fill.get("symbol", ""),
+            "amount": fill.get("amount", 0),
+        }
+    if len(fills) > 1:
+        return {
+            "action": "multi_trade",
+            "symbol": "",
+            "amount": 0,
+            "actions_count": len(fills),
+        }
+    if actions:
+        latest = actions[-1]
+        return {
+            "action": latest.get("action", "no_trade"),
+            "symbol": latest.get("symbol", ""),
+            "amount": latest.get("amount", 0),
+        }
+    return {"action": "no_trade", "symbol": "", "amount": 0}
 
 
 def upsert_position_record(modelname: str, record: Dict[str, Any]) -> None:
@@ -576,6 +687,7 @@ def upsert_position_record(modelname: str, record: Dict[str, Any]) -> None:
 
         existing_records: List[Dict[str, Any]] = []
         existing_id: Optional[int] = record.get("id")
+        matching_records: List[Dict[str, Any]] = []
         max_id = -1
 
         if position_file.exists():
@@ -598,6 +710,10 @@ def upsert_position_record(modelname: str, record: Dict[str, Any]) -> None:
                         # 已存在同一 (date + decision_time) 的记录：用新的 record 覆盖它
                         if existing_id is None:
                             existing_id = current_id
+                        normalized_match = copy.deepcopy(doc)
+                        normalized_match["positions"] = normalize_positions(normalized_match.get("positions", {}))
+                        normalized_match["decision_time"] = doc_decision_time
+                        matching_records.append(normalized_match)
                         continue
 
                     normalized_doc = copy.deepcopy(doc)
@@ -622,6 +738,20 @@ def upsert_position_record(modelname: str, record: Dict[str, Any]) -> None:
         if isinstance(action, dict):
             action_symbol = normalize_symbol(action.get("symbol"))
             action["symbol"] = action_symbol or ""
+
+        merged_actions: List[Dict[str, Any]] = []
+        merged_fills: List[Dict[str, Any]] = []
+        for matched in matching_records:
+            merged_actions.extend(_actions_from_record(matched))
+            merged_fills.extend(_fills_from_record(matched))
+        merged_actions.extend(_actions_from_record(clean_record))
+        merged_fills.extend(_fills_from_record(clean_record))
+        if merged_actions:
+            clean_record["actions"] = merged_actions
+        if merged_fills:
+            clean_record["fills"] = merged_fills
+        if merged_actions or merged_fills:
+            clean_record["this_action"] = _summarize_record_action(merged_actions, merged_fills)
 
         existing_records.append(clean_record)
 
@@ -679,6 +809,16 @@ def add_no_trade_record(today_date: str, decision_time: str, decision_count: int
             "symbol": "",
             "amount": 0,
         },
+        "actions": [
+            {
+                "action": "no_trade",
+                "symbol": "",
+                "amount": 0,
+                "decision_time": decision_time,
+                "decision_count": decision_count,
+            }
+        ],
+        "fills": [],
         "positions": sanitized_positions,
     }
 
@@ -743,4 +883,3 @@ def get_today_init_position(today_date: str, modelname: str) -> Dict[str, any]:
 def get_latest_position(today_date: str, modelname: str) -> tuple[Dict[str, any], int, Optional[Dict[str, Any]]]:
     """Deprecated: Use get_current_position instead."""
     return get_current_position(today_date, modelname)
-

@@ -263,6 +263,20 @@ def _buy_price_from_positions(record: Dict[str, Any], symbol: str) -> Optional[f
 
 def _iter_executed_buys(position_records: Iterable[Dict[str, Any]]) -> Iterable[Tuple[Dict[str, Any], Dict[str, Any]]]:
     for record in position_records:
+        fills = record.get("fills")
+        if isinstance(fills, list):
+            for fill in fills:
+                if not isinstance(fill, dict):
+                    continue
+                if str(fill.get("action") or "").lower() != "buy":
+                    continue
+                symbol = str(fill.get("symbol") or "").upper()
+                amount = _safe_float(fill.get("amount"), 0.0) or 0.0
+                if not symbol or amount <= 0:
+                    continue
+                yield record, fill
+            continue
+
         action = record.get("this_action")
         if not isinstance(action, dict):
             continue

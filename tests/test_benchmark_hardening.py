@@ -1,20 +1,31 @@
 import json
 import csv
+import asyncio
 import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+from langchain_core.tools import tool
 
-from benchmark.benchmark_evaluator import SnapshotPoint, evaluate, _write_buy_trades_csv, _write_summary_csv
+from benchmark.benchmark_evaluator import (
+    SnapshotPoint,
+    evaluate,
+    _iter_executed_buys,
+    _write_buy_trades_csv,
+    _write_summary_csv,
+)
 import main
-from agent_engine.agent.agent import AgenticWorkflow
+from agent_engine.agent.agent import AgenticWorkflow, OrderedTradingToolNode, serialized_position_tool
 from agent_engine.shared_prefetch import SharedPrefetchCoordinator
 from prompt_templates.prompts import STOP_SIGNAL, get_agent_system_prompt
 import utilities.live_scheduler as live_scheduler
 import utilities.prefetch_historical_news as prefetch_historical_news
+import utils.backup_utils as backup_utils
+from utils.json_file_manager import JsonFileManager
 from utilities.live_scheduler import _event_for, build_tick_config, next_pending_event, retry_attempts, write_error_artifacts
 from utils.position_manager import (
     get_available_sell_shares,
@@ -23,6 +34,7 @@ from utils.position_manager import (
     normalize_positions,
     remove_shares_from_lots,
     summarize_lots,
+    upsert_position_record,
 )
 
 
@@ -76,6 +88,254 @@ def test_position_file_uses_legacy_read_fallback(tmp_path, monkeypatch):
     assert get_position_file_path("model-a") == legacy / "position.jsonl"
     positions, _, _ = get_current_position("2026-01-12", "model-a")
     assert positions["CASH"] == 9
+
+
+def test_current_position_falls_back_across_market_holidays(tmp_path, monkeypatch):
+    project_root = tmp_path / "repo"
+    position_dir = project_root / "data_flow" / "trading_summary_each_agent" / "model-a" / "position"
+    position_dir.mkdir(parents=True)
+    (position_dir / "position.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "date": "2026-04-30",
+                        "decision_time": "2026-04-30 14:00:00",
+                        "id": 53,
+                        "positions": {
+                            "CASH": 670413.1536,
+                            "SH688111": {"shares": 1200, "purchase_date": "2026-04-17", "avg_price": 248.1},
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                ""
+            ]
+        ),
+        encoding="utf-8",
+    )
+    settings = project_root / "settings"
+    settings.mkdir()
+    (settings / "default_config.json").write_text(
+        json.dumps({"log_config": {"log_path": "./data_flow/trading_summary_each_agent"}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("utils.position_manager.__file__", str(project_root / "utils" / "position_manager.py"))
+
+    positions, current_id, latest_record = get_current_position("2026-05-06", "model-a")
+
+    assert current_id == 53
+    assert latest_record["decision_time"] == "2026-04-30 14:00:00"
+    assert positions["CASH"] == 670413.1536
+    assert positions["SH688111"]["shares"] == 1200
+
+
+def test_position_upsert_merges_actions_for_same_decision_time(tmp_path, monkeypatch):
+    project_root = tmp_path / "repo"
+    settings = project_root / "settings"
+    settings.mkdir(parents=True)
+    (settings / "default_config.json").write_text(
+        json.dumps({"log_config": {"log_path": "./data_flow/trading_summary_each_agent"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("utils.position_manager.__file__", str(project_root / "utils" / "position_manager.py"))
+
+    upsert_position_record(
+        "model-a",
+        {
+            "date": "2026-03-02",
+            "decision_time": "2026-03-02 10:30:00",
+            "decision_count": 1,
+            "this_action": {"action": "buy", "symbol": "SH688256", "amount": 100},
+            "actions": [
+                {
+                    "action": "buy",
+                    "symbol": "SH688256",
+                    "amount": 100,
+                    "price": 1000,
+                    "cost": 100000,
+                    "commission": 30,
+                }
+            ],
+            "fills": [
+                {
+                    "action": "buy",
+                    "symbol": "SH688256",
+                    "amount": 100,
+                    "price": 1000,
+                    "cost": 100000,
+                    "commission": 30,
+                }
+            ],
+            "positions": {"CASH": 899970, "SH688256": {"shares": 100, "purchase_date": "2026-03-02", "avg_price": 1000}},
+        },
+    )
+    upsert_position_record(
+        "model-a",
+        {
+            "date": "2026-03-02",
+            "decision_time": "2026-03-02 10:30:00",
+            "decision_count": 1,
+            "this_action": {"action": "no_trade", "symbol": "", "amount": 0},
+            "actions": [{"action": "no_trade", "symbol": "", "amount": 0}],
+            "fills": [],
+            "positions": {"CASH": 899970, "SH688256": {"shares": 100, "purchase_date": "2026-03-02", "avg_price": 1000}},
+        },
+    )
+
+    position_file = project_root / "data_flow" / "trading_summary_each_agent" / "model-a" / "position" / "position.jsonl"
+    rows = [json.loads(line) for line in position_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["this_action"] == {"action": "buy", "symbol": "SH688256", "amount": 100}
+    assert [action["action"] for action in rows[0]["actions"]] == ["buy", "no_trade"]
+    assert len(rows[0]["fills"]) == 1
+
+
+def test_serialized_position_tool_preserves_parallel_same_turn_trades(tmp_path, monkeypatch):
+    project_root = tmp_path / "repo"
+    settings = project_root / "settings"
+    settings.mkdir(parents=True)
+    (settings / "default_config.json").write_text(
+        json.dumps(
+            {
+                "agent_config": {"initial_cash": 1000000},
+                "log_config": {"log_path": "./data_flow/trading_summary_each_agent"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("utils.position_manager.__file__", str(project_root / "utils" / "position_manager.py"))
+
+    class DummyAgent:
+        signature = "model-a"
+
+        def __init__(self):
+            self._position_tool_lock = threading.RLock()
+
+        @serialized_position_tool
+        def trade(self, symbol, amount, cash_delta, delay):
+            positions, current_id, latest_record = get_current_position("2026-03-02", self.signature)
+            time.sleep(delay)
+            positions = json.loads(json.dumps(positions))
+            positions["CASH"] = float(positions.get("CASH", 0)) - cash_delta
+            positions[symbol] = {
+                "shares": int(positions.get(symbol, {}).get("shares", 0)) + amount,
+                "purchase_date": "2026-03-02",
+                "avg_price": cash_delta / amount,
+                "lots": [{"shares": amount, "purchase_date": "2026-03-02", "avg_price": cash_delta / amount}],
+            }
+            fill = {
+                "action": "buy",
+                "symbol": symbol,
+                "amount": amount,
+                "cost": cash_delta,
+                "decision_time": "2026-03-02 10:30:00",
+                "decision_count": 1,
+            }
+            record = {
+                "date": "2026-03-02",
+                "decision_time": "2026-03-02 10:30:00",
+                "decision_count": 1,
+                "this_action": {"action": "buy", "symbol": symbol, "amount": amount},
+                "actions": [fill],
+                "fills": [fill],
+                "positions": positions,
+            }
+            if latest_record and latest_record.get("decision_time") == "2026-03-02 10:30:00":
+                record["id"] = latest_record.get("id")
+            else:
+                record["id"] = current_id + 1
+            upsert_position_record(self.signature, record)
+
+    agent = DummyAgent()
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def worker(symbol, amount, cash_delta, delay):
+        try:
+            barrier.wait()
+            agent.trade(symbol, amount, cash_delta, delay)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=("SH688271", 100, 10000, 0.05)),
+        threading.Thread(target=worker, args=("SH688617", 200, 20000, 0.0)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    position_file = project_root / "data_flow" / "trading_summary_each_agent" / "model-a" / "position" / "position.jsonl"
+    rows = [json.loads(line) for line in position_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["this_action"] == {"action": "multi_trade", "symbol": "", "amount": 0, "actions_count": 2}
+    assert [fill["symbol"] for fill in row["fills"]] == ["SH688617", "SH688271"]
+    assert row["positions"]["CASH"] == 970000
+    assert row["positions"]["SH688271"]["shares"] == 100
+    assert row["positions"]["SH688617"]["shares"] == 200
+
+
+def test_ordered_trading_tool_node_runs_position_tools_in_call_order():
+    events = []
+
+    @tool
+    def buy_stock(symbol: str) -> str:
+        """Mock position-mutating buy tool."""
+        events.append(f"start:{symbol}")
+        if symbol == "A":
+            time.sleep(0.05)
+        events.append(f"end:{symbol}")
+        return symbol
+
+    node = OrderedTradingToolNode([buy_stock])
+    runtime = SimpleNamespace(context=None, store=None, stream_writer=None, execution_info=None, server_info=None)
+
+    result = node._func(
+        [
+            {"name": "buy_stock", "args": {"symbol": "A"}, "id": "call-1", "type": "tool_call"},
+            {"name": "buy_stock", "args": {"symbol": "B"}, "id": "call-2", "type": "tool_call"},
+        ],
+        {},
+        runtime,
+    )
+
+    assert events == ["start:A", "end:A", "start:B", "end:B"]
+    assert [msg.tool_call_id for msg in result["messages"]] == ["call-1", "call-2"]
+
+
+def test_ordered_trading_tool_node_async_runs_position_tools_in_call_order():
+    events = []
+
+    @tool
+    async def sell_stock(symbol: str) -> str:
+        """Mock position-mutating sell tool."""
+        events.append(f"start:{symbol}")
+        if symbol == "A":
+            await asyncio.sleep(0.05)
+        events.append(f"end:{symbol}")
+        return symbol
+
+    async def run_node():
+        node = OrderedTradingToolNode([sell_stock])
+        runtime = SimpleNamespace(context=None, store=None, stream_writer=None, execution_info=None, server_info=None)
+        return await node._afunc(
+            [
+                {"name": "sell_stock", "args": {"symbol": "A"}, "id": "call-1", "type": "tool_call"},
+                {"name": "sell_stock", "args": {"symbol": "B"}, "id": "call-2", "type": "tool_call"},
+            ],
+            {},
+            runtime,
+        )
+
+    result = asyncio.run(run_node())
+
+    assert events == ["start:A", "end:A", "start:B", "end:B"]
+    assert [msg.tool_call_id for msg in result["messages"]] == ["call-1", "call-2"]
 
 
 def test_startup_key_validation_routes_by_provider(monkeypatch, tmp_path):
@@ -199,6 +459,52 @@ def test_historical_news_prefetch_skips_weekend_calendar(monkeypatch, tmp_path):
     assert result.empty
 
 
+def test_historical_news_save_dedupes_cross_source_by_title_date(tmp_path):
+    rows = [
+        {
+            "symbol": "SH688981",
+            "title": "中芯国际 关于召开业绩说明会的公告",
+            "content": "cninfo copy",
+            "publish_time": "2026-04-30 09:00:00",
+            "source": "cninfo_fulltext",
+            "url": "http://cninfo",
+            "query": "中芯国际",
+            "search_time": "2026-05-01 00:00:00",
+        },
+        {
+            "symbol": "SH688981",
+            "title": "《中芯国际》关于召开业绩说明会的公告",
+            "content": "sse copy",
+            "publish_time": "2026-04-30 08:00:00",
+            "source": "sse_announcement",
+            "url": "http://sse",
+            "query": "上交所公告",
+            "search_time": "2026-05-01 00:00:00",
+        },
+        {
+            "symbol": "SH688981",
+            "title": "中芯国际 获得新订单",
+            "content": "media",
+            "publish_time": "2026-04-30 10:00:00",
+            "source": "sina_deep",
+            "url": "http://sina",
+            "query": "688981",
+            "search_time": "2026-05-01 00:00:00",
+        },
+    ]
+
+    saved = prefetch_historical_news._save_news(
+        tmp_path / "news.csv",
+        pd.DataFrame(columns=prefetch_historical_news.NEWS_COLUMNS),
+        rows,
+    )
+
+    assert len(saved) == 2
+    duplicate = saved[saved["title"].str.contains("业绩说明会", na=False)].iloc[0]
+    assert duplicate["source"] == "sse_announcement"
+    assert duplicate["url"] == "http://sse"
+
+
 def test_strict_snapshot_mode_accepts_legacy_env(monkeypatch):
     agent = object.__new__(AgenticWorkflow)
     monkeypatch.delenv("BACKTEST_MODE", raising=False)
@@ -319,12 +625,64 @@ def test_live_scheduler_news_prefetch_overrides_child_skip(monkeypatch):
     assert calls[0][0]["date_range"] == {"init_date": "2026-06-18", "end_date": "2026-06-18"}
 
 
+def test_live_scheduler_can_skip_news_prefetch_for_backfill(monkeypatch):
+    monkeypatch.setenv("ASTOCK_SKIP_EVENT_NEWS_PREFETCH", "1")
+
+    def fail_prefetch(_config, _symbols):
+        raise AssertionError("backfill should use existing news cache")
+
+    monkeypatch.setattr(live_scheduler.trading_main, "prefetch_configured_news_before_run", fail_prefetch)
+    config = {"run_config": {"live_prefetch_news_before_decision": True}}
+    event = _event_for("2026-06-18", "10:30:00", 1)
+
+    assert live_scheduler.prefetch_news_for_event(config, event) is True
+
+
 def test_live_scheduler_finds_next_pending_decision():
     config = {"run_config": {"live_decision_times": ["10:30:00"], "live_scheduler_catchup_minutes": 20}}
     event = next_pending_event(config, {"events": {}}, datetime(2026, 6, 17, 10, 31))
 
     assert event is not None
     assert event.decision_time == "2026-06-17 10:30:00"
+
+
+def test_live_scheduler_terminal_event_statuses_are_not_rerun():
+    config = {
+        "run_config": {
+            "live_decision_times": ["10:30:00", "11:30:00"],
+            "live_scheduler_catchup_minutes": 20,
+        }
+    }
+    state = {
+        "events": {
+            "2026-06-17#1#2026-06-17 10:30:00": {
+                "status": "partial_failed",
+                "date": "2026-06-17",
+                "decision_time": "2026-06-17 10:30:00",
+                "decision_count": 1,
+            }
+        }
+    }
+
+    event = next_pending_event(config, state, datetime(2026, 6, 17, 10, 31))
+
+    assert event is not None
+    assert event.decision_time == "2026-06-17 11:30:00"
+
+    failed_state = {
+        "events": {
+            "2026-06-17#1#2026-06-17 10:30:00": {
+                "status": "failed",
+                "date": "2026-06-17",
+                "decision_time": "2026-06-17 10:30:00",
+                "decision_count": 1,
+            }
+        }
+    }
+    failed_event = next_pending_event(config, failed_state, datetime(2026, 6, 17, 10, 31))
+
+    assert failed_event is not None
+    assert failed_event.decision_time == "2026-06-17 11:30:00"
 
 
 def test_live_scheduler_error_artifacts_include_human_csv(tmp_path):
@@ -562,6 +920,121 @@ def test_benchmark_evaluator_outputs_core_metrics(tmp_path):
     assert summary_rows[0]["price_confirmation_breach_count"] == "1"
     buy_rows = list(csv.DictReader((tmp_path / "buys.csv").open(encoding="utf-8")))
     assert buy_rows[0]["price_confirmation_breach"] == "True"
+
+
+def test_benchmark_evaluator_uses_fills_for_multi_trade_buys():
+    records = [
+        {
+            "decision_time": "2026-01-12 10:30:00",
+            "this_action": {"action": "multi_trade", "symbol": "", "amount": 0, "actions_count": 3},
+            "fills": [
+                {"action": "sell", "symbol": "SH688111", "amount": 100},
+                {"action": "buy", "symbol": "SH688256", "amount": 200},
+                {"action": "buy", "symbol": "SH688981", "amount": 300},
+            ],
+            "positions": {},
+        }
+    ]
+
+    buys = list(_iter_executed_buys(records))
+
+    assert [buy[1]["symbol"] for buy in buys] == ["SH688256", "SH688981"]
+    assert [buy[1]["amount"] for buy in buys] == [200, 300]
+
+
+def test_save_pnl_snapshot_is_transactional_under_parallel_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(backup_utils, "PROJECT_ROOT", tmp_path)
+    settings = tmp_path / "settings"
+    settings.mkdir(parents=True)
+    (settings / "default_config.json").write_text(
+        json.dumps({"agent_config": {"initial_cash": 1000000.0}}),
+        encoding="utf-8",
+    )
+    data_flow = tmp_path / "data_flow"
+    (data_flow / "trading_summary_each_agent" / "model-a" / "position").mkdir(parents=True)
+    (data_flow / "trading_summary_each_agent" / "model-a" / "position" / "position.jsonl").write_text(
+        json.dumps(
+            {
+                "id": 1,
+                "date": "2026-01-12",
+                "decision_time": "2026-01-12 10:30:00",
+                "decision_count": 1,
+                "positions": {
+                    "CASH": 990000.0,
+                    "SH600519": {
+                        "shares": 100,
+                        "purchase_date": "2026-01-12",
+                        "avg_price": 100.0,
+                        "lots": [{"shares": 100, "purchase_date": "2026-01-12", "avg_price": 100.0}],
+                    },
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (data_flow / "ai_stock_data.json").write_text(
+        json.dumps(
+            {
+                "SH600519": {
+                    "小时线行情": [
+                        {"time": "2026-01-12 10:00:00", "close": 110.0},
+                        {"time": "2026-01-12 11:00:00", "close": 120.0},
+                    ]
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    errors = []
+
+    def worker():
+        try:
+            assert backup_utils.save_pnl_snapshot("parallel-test") is True
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker), threading.Thread(target=worker)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    pnl_file = data_flow / "pnl_snapshots" / "pnl_model-a.json"
+    rows = json.loads(pnl_file.read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    assert rows[0]["decision_time"] == "2026-01-12 10:30:00"
+    assert rows[0]["realized_equity"] == pytest.approx(1000000.0)
+    assert rows[0]["unrealized_equity"] == pytest.approx(1001000.0)
+
+
+def test_json_file_manager_safe_write_json_is_concurrency_safe(tmp_path):
+    manager = JsonFileManager(max_retries=20, retry_delay=0.01)
+    target = tmp_path / "shared.json"
+    errors = []
+
+    def writer(idx):
+        payload = {"writer": idx, "rows": list(range(100)), "text": "x" * 1000}
+        try:
+            assert manager.safe_write_json(str(target), payload, backup=False) is True
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(idx,)) for idx in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["writer"] in range(8)
+    assert data["rows"] == list(range(100))
+    assert not list(tmp_path.glob("shared.json.tmp"))
+    assert not list(tmp_path.glob("shared.json.tmp.*"))
 
 
 def test_decision_run_artifacts_include_readable_markdown(tmp_path):
@@ -831,6 +1304,48 @@ def test_compact_snapshot_omits_hourly_candles_from_prompt():
     assert compact["indicators"]["SH600519"]["price_indicators"]["trend"]["SMA_5_vs_20_pct"] == 1.2
 
 
+def test_prefetch_all_prices_cuts_hourly_cache_at_decision_time():
+    class FakeDataManager:
+        def get_hourly_stock_data(self, symbol, end_date, lookback_hours):
+            index = pd.to_datetime(
+                [
+                    "2026-01-11 10:00:00",
+                    "2026-01-12 10:00:00",
+                    "2026-01-12 11:00:00",
+                    "2026-01-12 15:00:00",
+                ]
+            )
+            return pd.DataFrame(
+                {
+                    "open": [9.5, 10.0, 11.0, 12.0],
+                    "high": [10.0, 10.5, 11.5, 12.5],
+                    "low": [9.0, 9.5, 10.5, 11.5],
+                    "close": [9.8, 10.2, 11.2, 12.2],
+                    "volume": [1000, 1200, 1300, 1400],
+                },
+                index=index,
+            )
+
+    agent = AgenticWorkflow(
+        signature="test-agent",
+        basemodel="test-model",
+        stock_symbols=["SH600519"],
+        stock_json_path="./data_flow/ai_stock_data.json",
+        news_csv_path="./data_flow/news.csv",
+        openai_api_key="test",
+        init_date="2026-01-12",
+    )
+    agent.dm = FakeDataManager()
+
+    agent._prefetch_all_prices("2026-01-12", "2026-01-12 10:30:00")
+
+    payload = agent._prefetched_prices["SH600519"]
+    assert payload["summary"]["timestamp"] == "2026-01-12 10:00:00"
+    timestamps = [item["timestamp"] for item in payload["hourly_3d"]["candles"]]
+    assert "2026-01-12 11:00:00" not in timestamps
+    assert "2026-01-12 15:00:00" not in timestamps
+
+
 def test_snapshot_price_indicator_helpers_are_objective():
     agent = AgenticWorkflow(
         signature="test-agent",
@@ -967,6 +1482,8 @@ def test_search_stock_news_reads_requested_csv_range(tmp_path):
             "SH600519,old news,old,2026-01-01 09:00:00,src,http://old",
             "SH600519,recent news one,body1,2026-01-08 09:00:00,src,http://one",
             "SH600519,recent news two,body2,2026-01-12 10:00:00,src,http://two",
+            "SH600519,future news,body4,2026-01-12 15:00:00,src,http://future",
+            "SH600519,unknown time news,body5,not-a-time,src,http://unknown",
             "SH688008,other symbol,body3,2026-01-12 10:00:00,src,http://three",
         ]),
         encoding="utf-8",
@@ -1003,6 +1520,8 @@ def test_prefetch_all_news_populates_snapshot_from_csv(tmp_path):
             "SH600519,old news,old,2025-12-01 09:00:00,src,http://old",
             "SH600519,recent news one,body1,2026-01-08 09:00:00,src,http://one",
             "SH600519,recent news two,body2,2026-01-12 10:00:00,src,http://two",
+            "SH600519,future same day news,body4,2026-01-12 15:00:00,src,http://future",
+            "SH600519,unknown time news,body5,not-a-time,src,http://unknown",
             "SH688008,other symbol,body3,2026-01-12 10:00:00,src,http://three",
         ]),
         encoding="utf-8",
@@ -1079,6 +1598,44 @@ def test_prefetch_fetch_with_retry_returns_empty_after_exhausted_retries(monkeyp
     )
 
     assert result.empty
+
+
+def test_sina_deep_sleeps_between_pages(monkeypatch):
+    class FakeResponse:
+        def __init__(self, text):
+            self.text = text
+            self.encoding = "utf-8"
+
+        def raise_for_status(self):
+            return None
+
+    calls = []
+    sleeps = []
+
+    def fake_get(_url, params, headers, timeout):
+        calls.append(params["Page"])
+        if params["Page"] == 1:
+            return FakeResponse(
+                '2026-06-30&nbsp;10:00 <a href="https://finance.sina.com.cn/a.html">新闻一</a>'
+            )
+        return FakeResponse(
+            '2026-02-28&nbsp;10:00 <a href="https://finance.sina.com.cn/b.html">旧新闻</a>'
+        )
+
+    monkeypatch.setattr(prefetch_historical_news.requests, "get", fake_get)
+    monkeypatch.setattr(prefetch_historical_news, "_polite_sleep", lambda seconds: sleeps.append(seconds))
+
+    df = prefetch_historical_news.fetch_sina_stock_news_deep(
+        "SH688981",
+        timeout=1,
+        max_pages=2,
+        start_dt=pd.Timestamp("2026-03-01 00:00:00"),
+        page_sleep_seconds=0.5,
+    )
+
+    assert calls == [1, 2]
+    assert sleeps == [0.5]
+    assert len(df) == 1
 
 
 def test_trade_tool_validation_messages():
@@ -1243,6 +1800,37 @@ def test_benchmark_decision_report_schema_validation_flags_missing_sections():
     assert "actions_planned_or_taken.non_empty" in validation["missing_required_sections"]
 
 
+def test_decision_report_parser_recovers_json_inside_fenced_block_with_intro():
+    agent = object.__new__(AgenticWorkflow)
+    response_text = """
+```json
+Here is the structured report:
+{
+  "decision_evidence_report": {
+    "schema_version": 2,
+    "observed_universe": ["SH600519"],
+    "candidate_review": [],
+    "actions_planned_or_taken": [{"action": "no_trade", "reason_text": "wait", "risk_controls_cited": []}],
+    "workflow_trace": {
+      "has_candidate_review": false,
+      "has_news_evidence": false,
+      "has_price_evidence": false,
+      "has_risk_checks": false,
+      "has_action_reason": true,
+      "missing_required_sections": []
+    }
+  }
+}
+```
+"""
+
+    report, error = agent._extract_benchmark_decision_report(response_text)
+
+    assert error is None
+    assert report["schema_version"] == 2
+    assert report["actions_planned_or_taken"][0]["action"] == "no_trade"
+
+
 def test_legacy_benchmark_report_name_still_parses():
     agent = AgenticWorkflow(
         signature="test-agent",
@@ -1278,3 +1866,4 @@ def test_agent_system_prompt_preserves_json_schema_braces():
     assert "Never expose excuses" not in prompt
     assert "available_to_sell" in prompt
     assert "locked_today" in prompt
+    assert "never call more than one position-mutating tool" in prompt

@@ -15,6 +15,7 @@ import subprocess
 import time
 import warnings
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from zoneinfo import ZoneInfo
@@ -35,9 +36,12 @@ from dotenv import load_dotenv
 import threading
 
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import ToolNode, create_react_agent
+from langgraph.prebuilt.tool_node import ToolRuntime, get_config_list
+from langgraph.runtime import Runtime
 
 # Import project tools
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,10 +63,12 @@ from utils.position_manager import (
     calculate_previous_trading_date,
     get_available_sell_shares,
     get_current_position,
+    file_transaction_lock,
     normalize_decision_time,
     normalize_positions,
     remove_shares_from_lots,
     normalize_symbol,
+    position_transaction_lock,
     strip_exchange_prefix,
     summarize_lots,
     upsert_position_record,
@@ -74,6 +80,79 @@ from prompt_templates.prompts import get_agent_system_prompt, STOP_SIGNAL
 
 # 并发安全：用于保护 news.csv 写入
 NEWS_FILE_LOCK = threading.Lock()
+POSITION_MUTATING_TOOL_NAMES = {"buy_stock", "sell_stock", "add_no_trade_record_tool"}
+
+
+def serialized_position_tool(func):
+    """Serialize position-mutating tools within one agent process."""
+
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        lock = getattr(self, "_position_tool_lock", None)
+        if lock is None:
+            with position_transaction_lock(self.signature):
+                return func(self, *args, **kwargs)
+        with lock:
+            with position_transaction_lock(self.signature):
+                return func(self, *args, **kwargs)
+
+    return wrapper
+
+
+class OrderedTradingToolNode(ToolNode):
+    """Run trading mutations in model-emitted order, while leaving read-only tools parallel."""
+
+    @staticmethod
+    def _has_position_mutation(tool_calls: List[Dict[str, Any]]) -> bool:
+        return any(str(call.get("name") or "") in POSITION_MUTATING_TOOL_NAMES for call in tool_calls)
+
+    def _tool_runtimes_for_calls(
+        self,
+        input: Any,
+        config: RunnableConfig,
+        runtime: Runtime,
+        tool_calls: List[Dict[str, Any]],
+    ) -> List[Any]:
+        config_list = get_config_list(config, len(tool_calls))
+        tool_runtimes = []
+        for call, cfg in zip(tool_calls, config_list, strict=False):
+            state = self._extract_state(input, cfg)
+            tool_runtimes.append(
+                ToolRuntime(
+                    state=state,
+                    tool_call_id=call["id"],
+                    config=cfg,
+                    context=runtime.context,
+                    store=runtime.store,
+                    stream_writer=runtime.stream_writer,
+                    tools=list(self.tools_by_name.values()),
+                    execution_info=runtime.execution_info,
+                    server_info=runtime.server_info,
+                )
+            )
+        return tool_runtimes
+
+    def _func(self, input: Any, config: RunnableConfig, runtime: Runtime) -> Any:
+        tool_calls, input_type = self._parse_input(input)
+        if not self._has_position_mutation(tool_calls):
+            return super()._func(input, config, runtime)
+
+        tool_runtimes = self._tool_runtimes_for_calls(input, config, runtime, tool_calls)
+        outputs = []
+        for call, tool_runtime in zip(tool_calls, tool_runtimes, strict=False):
+            outputs.append(self._run_one(call, input_type, tool_runtime))
+        return self._combine_tool_outputs(outputs, input_type)
+
+    async def _afunc(self, input: Any, config: RunnableConfig, runtime: Runtime) -> Any:
+        tool_calls, input_type = self._parse_input(input)
+        if not self._has_position_mutation(tool_calls):
+            return await super()._afunc(input, config, runtime)
+
+        tool_runtimes = self._tool_runtimes_for_calls(input, config, runtime, tool_calls)
+        outputs = []
+        for call, tool_runtime in zip(tool_calls, tool_runtimes, strict=False):
+            outputs.append(await self._arun_one(call, input_type, tool_runtime))
+        return self._combine_tool_outputs(outputs, input_type)
 
 
 class AgenticWorkflow:
@@ -173,6 +252,7 @@ class AgenticWorkflow:
         self._prefetched_indicators: Dict[str, Dict[str, Any]] = {}
         self._last_prefetch_bundle: Optional[Dict[str, Any]] = None
         self._current_snapshot_info: Dict[str, Any] = {}
+        self._position_tool_lock = threading.RLock()
         self.max_steps = max_steps
         self.max_retries = max_retries
         self.base_delay = base_delay
@@ -850,23 +930,24 @@ class AgenticWorkflow:
         if not csv_path or not os.path.exists(csv_path):
             return
         with NEWS_FILE_LOCK:
-            df = None
-            for encoding in ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'latin1']:
-                try:
-                    df = pd.read_csv(csv_path, encoding=encoding)
-                    print(f"✅ 使用 {encoding} 编码成功读取 {csv_path} 以进行清理")
-                    break
-                except Exception:
-                    continue
-            if df is None or df.empty:
-                return
-            df = self._sanitize_news_dataframe(df)
-            filtered_df = self._filter_allowed_news_df(df)
-            if filtered_df is None:
-                return
-            if len(filtered_df) != len(df):
-                filtered_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                print(f"🧹 已清理 {csv_path} 中的非白名单新闻记录")
+            with file_transaction_lock(csv_path, suffix=".news.lock"):
+                df = None
+                for encoding in ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'latin1']:
+                    try:
+                        df = pd.read_csv(csv_path, encoding=encoding)
+                        print(f"✅ 使用 {encoding} 编码成功读取 {csv_path} 以进行清理")
+                        break
+                    except Exception:
+                        continue
+                if df is None or df.empty:
+                    return
+                df = self._sanitize_news_dataframe(df)
+                filtered_df = self._filter_allowed_news_df(df)
+                if filtered_df is None:
+                    return
+                if len(filtered_df) != len(df):
+                    filtered_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                    print(f"🧹 已清理 {csv_path} 中的非白名单新闻记录")
     
     # --- 本地工具函数定义 (DM Functions) ---
     
@@ -1692,6 +1773,7 @@ class AgenticWorkflow:
         except Exception as e:
             return json.dumps({"error": f"获取最新持仓时出错: {str(e)}"})
     
+    @serialized_position_tool
     def add_no_trade_record_tool(self, today_date: str) -> str:
         """为当前代理在给定日期记录"无交易"操作。此函数更新代理的持仓文件以延续前一天的持仓。"""
         try:
@@ -1798,6 +1880,7 @@ class AgenticWorkflow:
         except Exception:
             return 0.0
     
+    @serialized_position_tool
     def buy_stock(self, symbol: str, amount: int) -> str:
         """
         买入股票（使用当前小时级价格）。
@@ -2035,11 +2118,23 @@ class AgenticWorkflow:
             new_position = normalize_positions(new_position)
 
             # 记录交易
+            fill = {
+                "action": "buy",
+                "symbol": normalized_symbol,
+                "amount": amount,
+                "price": this_symbol_price,
+                "cost": required_cash,
+                "commission": commission,
+                "decision_time": decision_time,
+                "decision_count": decision_count,
+            }
             record: Dict[str, Any] = {
                 "date": today_date,
                 "decision_time": decision_time,
                 "decision_count": decision_count,
                 "this_action": {"action": "buy", "symbol": normalized_symbol, "amount": amount},
+                "actions": [fill],
+                "fills": [fill],
                 "positions": new_position
             }
             if latest_record and latest_record.get("decision_time") == decision_time:
@@ -2204,9 +2299,11 @@ class AgenticWorkflow:
         if parsed_ts.dt.tz is not None:
             parsed_ts = parsed_ts.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
         df = df.assign(_parsed_publish_time=parsed_ts)
+        # 回测/共享 snapshot 必须 fail-closed：没有可解析发布时间的新闻无法证明在决策时点已可见。
         df = df[
-            df["_parsed_publish_time"].isna()
-            | ((df["_parsed_publish_time"] >= start_dt) & (df["_parsed_publish_time"] <= end_dt))
+            df["_parsed_publish_time"].notna()
+            & (df["_parsed_publish_time"] >= start_dt)
+            & (df["_parsed_publish_time"] <= end_dt)
         ]
         df = df.sort_values("_parsed_publish_time", ascending=False, na_position="last")
 
@@ -2437,77 +2534,78 @@ class AgenticWorkflow:
                     try:
                         self._purge_news_csv(csv_path)
                         with NEWS_FILE_LOCK:
-                            os.makedirs('data_flow', exist_ok=True)
-                            df_new = pd.DataFrame(realtime_results)
-                            df_new = self._sanitize_news_dataframe(df_new)
-                            df_new = self._filter_allowed_news_df(df_new)
-                            if df_new is None or df_new.empty:
-                                continue
-                            if 'search_time' not in df_new.columns:
-                                df_new['search_time'] = str(search_time)
-                            else:
-                                df_new['search_time'] = df_new['search_time'].astype(str)
-                            dedupe_subset = ['symbol', 'title', 'search_time', 'query']
-                            df_new = df_new.drop_duplicates(subset=dedupe_subset, keep='last')
-                            
-                            if os.path.exists(csv_path):
-                                # 尝试多种编码读取现有文件
-                                old = None
-                                for encoding in ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'latin1']:
-                                    try:
-                                        old = pd.read_csv(csv_path, encoding=encoding)
-                                        print(f"✅ 使用 {encoding} 编码成功读取 news.csv")
-                                        break
-                                    except Exception:
-                                        continue
-                                
-                                if old is not None:
-                                    old = self._sanitize_news_dataframe(old)
-                                    old = self._filter_allowed_news_df(old)
-                                    if 'search_time' not in old.columns:
-                                        old['search_time'] = pd.NA
-                                    mask = ~(
-                                        (old['symbol'].astype(str) == str(normalized_symbol or symbol_for_query)) &
-                                        (old['query'].astype(str) == str(query)) &
-                                        (old['search_time'].astype(str) == str(search_time))
-                                    )
-                                    old = old[mask]
-                                    # 合并并去重
-                                    combined = pd.concat([old, df_new], axis=0, ignore_index=True)
-                                    combined = self._sanitize_news_dataframe(combined)
-                                    combined = combined.drop_duplicates(subset=dedupe_subset, keep='last')
-                                    
-                                    # 对合并后的数据按 symbol 分组进行嵌入去重（针对科创板新闻）
-                                    try:
-                                        if 'symbol' in combined.columns and 'title' in combined.columns:
-                                            # 按 symbol 分组去重
-                                            deduplicated_groups = []
-                                            for symbol_code, group in combined.groupby('symbol'):
-                                                if symbol_code and str(symbol_code).startswith('SH688'):
-                                                    print(f"🔍 对股票 {symbol_code} 的 {len(group)} 条新闻进行嵌入去重...")
-                                                    group_list = group.to_dict('records')
-                                                    deduplicated_list = deduplicate_news_by_embedding(
-                                                        group_list,
-                                                        similarity_threshold=0.85,
-                                                        field_to_compare='title'
-                                                    )
-                                                    deduplicated_groups.extend(deduplicated_list)
-                                                else:
-                                                    # 非科创板新闻不去重
-                                                    deduplicated_groups.extend(group.to_dict('records'))
-                                            combined = pd.DataFrame(deduplicated_groups)
-                                    except Exception as e:
-                                        print(f"⚠️ 合并后的嵌入去重失败: {e}，跳过去重步骤")
-                                    
-                                    combined.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                                    print(f"💾 已将新闻追加到 {csv_path}（去重后）")
+                            with file_transaction_lock(csv_path, suffix=".news.lock"):
+                                os.makedirs('data_flow', exist_ok=True)
+                                df_new = pd.DataFrame(realtime_results)
+                                df_new = self._sanitize_news_dataframe(df_new)
+                                df_new = self._filter_allowed_news_df(df_new)
+                                if df_new is None or df_new.empty:
+                                    continue
+                                if 'search_time' not in df_new.columns:
+                                    df_new['search_time'] = str(search_time)
                                 else:
-                                    # 如果所有编码都失败，直接覆盖
+                                    df_new['search_time'] = df_new['search_time'].astype(str)
+                                dedupe_subset = ['symbol', 'title', 'search_time', 'query']
+                                df_new = df_new.drop_duplicates(subset=dedupe_subset, keep='last')
+                                
+                                if os.path.exists(csv_path):
+                                    # 尝试多种编码读取现有文件
+                                    old = None
+                                    for encoding in ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'latin1']:
+                                        try:
+                                            old = pd.read_csv(csv_path, encoding=encoding)
+                                            print(f"✅ 使用 {encoding} 编码成功读取 news.csv")
+                                            break
+                                        except Exception:
+                                            continue
+                                    
+                                    if old is not None:
+                                        old = self._sanitize_news_dataframe(old)
+                                        old = self._filter_allowed_news_df(old)
+                                        if 'search_time' not in old.columns:
+                                            old['search_time'] = pd.NA
+                                        mask = ~(
+                                            (old['symbol'].astype(str) == str(normalized_symbol or symbol_for_query)) &
+                                            (old['query'].astype(str) == str(query)) &
+                                            (old['search_time'].astype(str) == str(search_time))
+                                        )
+                                        old = old[mask]
+                                        # 合并并去重
+                                        combined = pd.concat([old, df_new], axis=0, ignore_index=True)
+                                        combined = self._sanitize_news_dataframe(combined)
+                                        combined = combined.drop_duplicates(subset=dedupe_subset, keep='last')
+                                        
+                                        # 对合并后的数据按 symbol 分组进行嵌入去重（针对科创板新闻）
+                                        try:
+                                            if 'symbol' in combined.columns and 'title' in combined.columns:
+                                                # 按 symbol 分组去重
+                                                deduplicated_groups = []
+                                                for symbol_code, group in combined.groupby('symbol'):
+                                                    if symbol_code and str(symbol_code).startswith('SH688'):
+                                                        print(f"🔍 对股票 {symbol_code} 的 {len(group)} 条新闻进行嵌入去重...")
+                                                        group_list = group.to_dict('records')
+                                                        deduplicated_list = deduplicate_news_by_embedding(
+                                                            group_list,
+                                                            similarity_threshold=0.85,
+                                                            field_to_compare='title'
+                                                        )
+                                                        deduplicated_groups.extend(deduplicated_list)
+                                                    else:
+                                                        # 非科创板新闻不去重
+                                                        deduplicated_groups.extend(group.to_dict('records'))
+                                                combined = pd.DataFrame(deduplicated_groups)
+                                        except Exception as e:
+                                            print(f"⚠️ 合并后的嵌入去重失败: {e}，跳过去重步骤")
+                                        
+                                        combined.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                                        print(f"💾 已将新闻追加到 {csv_path}（去重后）")
+                                    else:
+                                        # 如果所有编码都失败，直接覆盖
+                                        df_new.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                                        print(f"⚠️ 无法读取旧文件，已创建新文件 {csv_path}")
+                                else:
                                     df_new.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                                    print(f"⚠️ 无法读取旧文件，已创建新文件 {csv_path}")
-                            else:
-                                df_new.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                                print(f"💾 已创建新闻文件 {csv_path}")
+                                    print(f"💾 已创建新闻文件 {csv_path}")
                     except Exception as e:
                         print(f"⚠️ 保存新闻到CSV失败: {e}")
                     
@@ -2657,6 +2755,7 @@ class AgenticWorkflow:
                 'message': self._provider_downtime_message("AKShare")
             }, ensure_ascii=False)
     
+    @serialized_position_tool
     def sell_stock(self, symbol: str, amount: int) -> str:
         """
         卖出股票（使用当前小时级价格）。
@@ -2846,11 +2945,25 @@ class AgenticWorkflow:
             new_position = normalize_positions(new_position)
             
             # 记录交易
+            fill = {
+                "action": "sell",
+                "symbol": normalized_symbol,
+                "amount": amount,
+                "price": this_symbol_price,
+                "revenue": revenue,
+                "commission": commission,
+                "stamp_duty": stamp_duty,
+                "net_revenue": net_revenue,
+                "decision_time": decision_time,
+                "decision_count": decision_count,
+            }
             record: Dict[str, Any] = {
                 "date": today_date,
                 "decision_time": decision_time,
                 "decision_count": decision_count,
                 "this_action": {"action": "sell", "symbol": normalized_symbol, "amount": amount},
+                "actions": [fill],
+                "fills": [fill],
                 "positions": new_position
             }
             if latest_record and latest_record.get("decision_time") == decision_time:
@@ -2898,7 +3011,7 @@ class AgenticWorkflow:
         else:
             print(f"❌ DataManager 未初始化,未加载任何工具")
             self.tools = []
-        
+
         if self.basemodel.startswith("gemini"):
             print(f"🤖 Initializing Google Gemini model: {self.basemodel}")
             gemini_safety_settings = None
@@ -3221,44 +3334,23 @@ class AgenticWorkflow:
             return None, "empty_content"
         import re
 
+        markers = ('"decision_evidence_report"', '"benchmark_decision_report"')
         candidates: List[str] = []
-        fenced_blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, flags=re.IGNORECASE | re.DOTALL)
-        candidates.extend(fenced_blocks)
+        fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)```", content, flags=re.IGNORECASE | re.DOTALL)
+        for block in fenced_blocks:
+            candidates.extend(self._json_object_candidates(block, markers))
+        candidates.extend(self._json_object_candidates(content, markers))
 
-        marker_idx = -1
-        for marker in ('"decision_evidence_report"', '"benchmark_decision_report"'):
-            marker_idx = content.find(marker)
-            if marker_idx >= 0:
-                break
-        if marker_idx >= 0:
-            start = content.rfind("{", 0, marker_idx)
-            if start >= 0:
-                depth = 0
-                in_string = False
-                escape = False
-                for idx in range(start, len(content)):
-                    ch = content[idx]
-                    if escape:
-                        escape = False
-                        continue
-                    if ch == "\\":
-                        escape = True
-                        continue
-                    if ch == '"':
-                        in_string = not in_string
-                        continue
-                    if in_string:
-                        continue
-                    if ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0:
-                            candidates.append(content[start: idx + 1])
-                            break
+        seen_candidates = set()
+        unique_candidates: List[str] = []
+        for raw in candidates:
+            if raw in seen_candidates:
+                continue
+            seen_candidates.add(raw)
+            unique_candidates.append(raw)
 
         last_error = "decision_evidence_report_not_found"
-        for raw in candidates:
+        for raw in unique_candidates:
             parsed, parse_error = self._parse_llm_json_candidate(raw)
             if parsed is None:
                 last_error = parse_error or "json_parse_error"
@@ -3268,6 +3360,62 @@ class AgenticWorkflow:
             if isinstance(parsed, dict) and isinstance(parsed.get("benchmark_decision_report"), dict):
                 return parsed["benchmark_decision_report"], None
         return None, last_error
+
+    def _json_object_candidates(self, text: str, markers: Tuple[str, ...]) -> List[str]:
+        """Find balanced JSON objects that contain one of the report markers."""
+        candidates: List[str] = []
+        if not text:
+            return candidates
+
+        for marker in markers:
+            search_from = 0
+            while True:
+                marker_idx = text.find(marker, search_from)
+                if marker_idx < 0:
+                    break
+                start = text.rfind("{", 0, marker_idx)
+                while start >= 0:
+                    candidate = self._balanced_json_object_from(text, start)
+                    if candidate and marker in candidate:
+                        candidates.append(candidate)
+                        break
+                    start = text.rfind("{", 0, start)
+                search_from = marker_idx + len(marker)
+
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            candidate = self._balanced_json_object_from(stripped, 0)
+            if candidate and any(marker in candidate for marker in markers):
+                candidates.append(candidate)
+        return candidates
+
+    def _balanced_json_object_from(self, text: str, start: int) -> Optional[str]:
+        """Return the balanced JSON object starting at start, respecting quoted strings."""
+        if start < 0 or start >= len(text) or text[start] != "{":
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start: idx + 1]
+        return None
 
     def _parse_llm_json_candidate(self, raw: str) -> Tuple[Optional[Any], Optional[str]]:
         """Parse model-emitted JSON, repairing the common unescaped quote case once."""
@@ -4587,7 +4735,7 @@ class AgenticWorkflow:
         # Update system prompt with decision count
         self.agent = create_react_agent(
             self.model,
-            tools=self.tools,
+            tools=OrderedTradingToolNode(self.tools),
             prompt=get_agent_system_prompt(
                 today_date,
                 self.signature,
@@ -4756,10 +4904,14 @@ class AgenticWorkflow:
             "1. 生成Observation Summary（覆盖所有股票）\n"
             "2. 基于分析进行交易决策；BUY、SELL、HOLD、active waiting/no_trade 同等有效，不要为了活跃而交易。\n"
             "3. 输出一个合法 fenced JSON block，顶层必须包含 decision_evidence_report，schema_version 必须为 2。该 JSON 必须包含 observed_universe、candidate_review、actions_planned_or_taken、workflow_trace。\n"
-            "4. candidate_review 只记录你当时使用的证据：新闻标题/发布时间/来源/你的解释、价格指标、signal_evaluation、风险检查、买入或拒绝理由。不要输出 Fin-SNR Failure、Top3、hit/miss、news-conflict failure、overheated-positive-news failure、weak-reason loss 等事后结论。\n"
-            "5. actions_planned_or_taken 只记录实际计划或已执行动作，以及动作理由和链接的证据标题；如果不交易，也必须写一条 no_trade 动作和 reason_text，并引用至少2个具体数据点作为主动观望依据。\n"
-            "6. 若考虑 SELL，必须先使用 Holdings detail 中的 available_to_sell，而不是 total shares；locked_today 不可卖。\n"
-            f"7. 使用 {STOP_SIGNAL} 结束"
+            "4. 即使某项没有证据，也必须用 []、\"\"、false 或 null 填入对应 key；不要省略 required key，不要在 JSON block 内写解释文字或尾随逗号。\n"
+            "5. candidate_review 的每个候选股票必须是一个完整对象；risk_checks_mentioned、buy_reason_text、reject_or_hold_reason_text 必须在该候选对象内部，不能写在对象闭合之后。\n"
+            "6. candidate_review 只记录你当时使用的证据：新闻标题/发布时间/来源/你的解释、价格指标、signal_evaluation、风险检查、买入或拒绝理由。不要输出 Fin-SNR Failure、Top3、hit/miss、news-conflict failure、overheated-positive-news failure、weak-reason loss 等事后结论。\n"
+            "7. actions_planned_or_taken 只记录实际计划或已执行动作，以及动作理由和链接的证据标题；如果不交易，也必须写一条 no_trade 动作和 reason_text，并引用至少2个具体数据点作为主动观望依据。\n"
+            "8. 若考虑 SELL，必须先使用 Holdings detail 中的 available_to_sell，而不是 total shares；locked_today 不可卖。\n"
+            "9. 最终回答的最后部分必须是且只能是一个 fenced JSON block，然后紧跟结束信号；JSON 后不要再写解释、Markdown 列表或表格。\n"
+            "10. 提交前自检：每个 candidate_review 对象都必须包含 symbol、rank、selected_for_action、news_evidence_used、price_evidence_used、risk_checks_mentioned、buy_reason_text、reject_or_hold_reason_text；每个 signal_evaluation 都必须包含 momentum_reading、trend_reading、risk_reading、momentum_trend_conflict、decision_implication。\n"
+            f"11. 使用 {STOP_SIGNAL} 结束"
         )
 
         user_query = [{"role": "user", "content": context_message}]

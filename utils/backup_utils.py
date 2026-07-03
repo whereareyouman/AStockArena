@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from utils.position_manager import file_transaction_lock
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BACKUP_SCRIPT = PROJECT_ROOT / "utilities" / "backup_data.py"
 
@@ -371,48 +373,65 @@ def save_pnl_snapshot(reason: str) -> bool:
             safe_signature = signature.replace(":", "-").replace("/", "-").replace("\\", "-").replace("<", "_").replace(">", "_").replace('"', "_").replace("|", "_").replace("?", "_").replace("*", "_").replace(" ", "_")
             pnl_file = pnl_dir / f"pnl_{safe_signature}.json"
             
-            # 读取现有数据（如果存在）
-            existing_data = []
-            if pnl_file.exists():
-                try:
-                    with open(pnl_file, 'r', encoding='utf-8') as f:
-                        existing_data = json.load(f)
-                except Exception:
-                    existing_data = []
-            
-            # 合并数据：按 (date, decision_time) 去重，保留最新的记录（通过 id 判断）
-            merged_by_datetime = {}
-            # 先添加现有数据（兼容旧格式：可能没有 decision_time 字段）
-            for item in existing_data:
-                d = item.get("date")
-                decision_time = item.get("decision_time", "")
-                if d:
-                    key = f"{d}_{decision_time}"
-                    existing_id = item.get("id", -1)
-                    if key not in merged_by_datetime or existing_id > merged_by_datetime[key].get("id", -1):
-                        merged_by_datetime[key] = item
-            
-            # 再添加新数据（会覆盖同决策时点的旧数据）
-            for item in new_pnl_data:
-                d = item.get("date")
-                decision_time = item.get("decision_time", "")
-                if d:
-                    key = f"{d}_{decision_time}"
-                    new_id = item.get("id", -1)
-                    if key not in merged_by_datetime or new_id >= merged_by_datetime[key].get("id", -1):
-                        merged_by_datetime[key] = item
-            
-            # 按日期和时间排序并保存
-            def sort_key(x):
-                date_str = x.get("date", "")
-                time_str = x.get("decision_time", "")
-                return (date_str, time_str)
-            
-            final_data = sorted(merged_by_datetime.values(), key=sort_key)
-            
             try:
-                with open(pnl_file, 'w', encoding='utf-8') as f:
-                    json.dump(final_data, f, indent=2, ensure_ascii=False)
+                with file_transaction_lock(pnl_file, suffix=".txn.lock"):
+                    # 读取现有数据（如果存在）
+                    existing_data = []
+                    if pnl_file.exists():
+                        try:
+                            with open(pnl_file, 'r', encoding='utf-8') as f:
+                                loaded = json.load(f)
+                                existing_data = loaded if isinstance(loaded, list) else []
+                        except Exception:
+                            existing_data = []
+
+                    # 合并数据：按 (date, decision_time) 去重，保留最新的记录（通过 id 判断）
+                    merged_by_datetime = {}
+                    # 先添加现有数据（兼容旧格式：可能没有 decision_time 字段）
+                    for item in existing_data:
+                        if not isinstance(item, dict):
+                            continue
+                        d = item.get("date")
+                        decision_time = item.get("decision_time", "")
+                        if d:
+                            key = f"{d}_{decision_time}"
+                            existing_id = item.get("id", -1)
+                            if key not in merged_by_datetime or existing_id > merged_by_datetime[key].get("id", -1):
+                                merged_by_datetime[key] = item
+
+                    # 再添加新数据（会覆盖同决策时点的旧数据）
+                    for item in new_pnl_data:
+                        d = item.get("date")
+                        decision_time = item.get("decision_time", "")
+                        if d:
+                            key = f"{d}_{decision_time}"
+                            new_id = item.get("id", -1)
+                            if key not in merged_by_datetime or new_id >= merged_by_datetime[key].get("id", -1):
+                                merged_by_datetime[key] = item
+
+                    # 按日期和时间排序并保存
+                    def sort_key(x):
+                        date_str = x.get("date", "")
+                        time_str = x.get("decision_time", "")
+                        return (date_str, time_str)
+
+                    final_data = sorted(merged_by_datetime.values(), key=sort_key)
+                    tmp_file = pnl_file.with_name(f"{pnl_file.name}.tmp.{os.getpid()}.{datetime.now().timestamp()}")
+                    try:
+                        with open(tmp_file, 'w', encoding='utf-8') as f:
+                            json.dump(final_data, f, indent=2, ensure_ascii=False)
+                            try:
+                                f.flush()
+                                os.fsync(f.fileno())
+                            except Exception:
+                                pass
+                        os.replace(tmp_file, pnl_file)
+                    finally:
+                        try:
+                            if tmp_file.exists():
+                                tmp_file.unlink()
+                        except Exception:
+                            pass
                 success_count += 1
             except Exception as e:
                 print(f"[WARNING] Failed to save PnL snapshot for {signature}: {e}")

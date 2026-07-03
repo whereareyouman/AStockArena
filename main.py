@@ -119,6 +119,15 @@ def prefetch_configured_news_before_run(config: dict, stock_symbols) -> None:
     timeout = int(run_config.get("prefetch_news_timeout", 30))
     max_retries = int(run_config.get("prefetch_news_max_retries", 3))
     retry_backoff_seconds = float(run_config.get("prefetch_news_retry_backoff_seconds", 3.0))
+    tushare_sources = run_config.get("prefetch_news_tushare_sources")
+    if not isinstance(tushare_sources, list):
+        tushare_sources = None
+    tushare_chunk_days = int(run_config.get("prefetch_news_tushare_chunk_days", 1))
+    tushare_chunk_hours_raw = run_config.get("prefetch_news_tushare_chunk_hours", 6)
+    tushare_chunk_hours = int(tushare_chunk_hours_raw) if tushare_chunk_hours_raw not in (None, "") else None
+    sina_max_pages_raw = run_config.get("prefetch_news_sina_max_pages")
+    sina_max_pages = int(sina_max_pages_raw) if sina_max_pages_raw not in (None, "") else None
+    sina_page_sleep_seconds = float(run_config.get("prefetch_news_sina_page_sleep_seconds", 0.8))
     print(
         "📰 Prefetching news before run: "
         f"{start_dt.strftime('%Y-%m-%d')} -> {end_date}, "
@@ -135,8 +144,17 @@ def prefetch_configured_news_before_run(config: dict, stock_symbols) -> None:
         sleep_seconds=sleep_seconds,
         max_retries=max_retries,
         retry_backoff_seconds=retry_backoff_seconds,
-        use_akshare_stock_news=True,
-        use_akshare_calendar_events=True,
+        use_akshare_stock_news=_truthy_config(run_config.get("prefetch_news_use_akshare_stock_news", True)),
+        use_akshare_calendar_events=_truthy_config(run_config.get("prefetch_news_use_akshare_calendar_events", True)),
+        use_tushare_news=_truthy_config(run_config.get("prefetch_news_use_tushare", True)),
+        tushare_sources=tushare_sources,
+        tushare_chunk_days=tushare_chunk_days,
+        tushare_chunk_hours=tushare_chunk_hours,
+        use_sina_deep=_truthy_config(run_config.get("prefetch_news_use_sina_deep", True)),
+        sina_max_pages=sina_max_pages,
+        sina_page_sleep_seconds=sina_page_sleep_seconds,
+        use_sse_announcements=_truthy_config(run_config.get("prefetch_news_use_sse_announcements", True)),
+        use_cninfo_fulltext=_truthy_config(run_config.get("prefetch_news_use_cninfo_fulltext", True)),
     )
 
 
@@ -555,9 +573,7 @@ async def main(config_path=None):
         except Exception as e:
             print(f"❌ Error processing model {model_name} ({signature}): {str(e)}")
             print(f"📋 Error details: {e}")
-            # Can choose to continue processing next model, or exit
-            # continue  # Continue processing next model
-            exit()  # Or exit program
+            raise
         
         print("=" * 60)
         print(f"✅ Model {model_name} ({signature}) initialized")

@@ -171,72 +171,90 @@ class JsonFileManager:
         try:
             # 确保目录存在
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            
-            # 备份原文件（如果存在且需要备份）
-            backup_path = None
-            if backup and os.path.exists(path):
-                backup_path = f"{path}.backup"
-                try:
-                    shutil.copy2(path, backup_path)
-                    logger.debug(f"已备份文件: {backup_path}")
-                except Exception as e:
-                    logger.warning(f"备份文件失败: {e}")
-                    backup_path = None
-            
-            # 写入临时文件
-            temp_path = f"{path}.tmp"
+
+            lock_path = f"{path}.lock"
+            lock_handle = open(lock_path, "w+", encoding="utf-8")
             try:
-                with open(temp_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=4)
-                
-                # 验证临时文件的JSON格式
+                acquired = False
+                for attempt in range(self.max_retries):
+                    if self._acquire_lock(lock_handle, exclusive=True):
+                        acquired = True
+                        break
+                    if attempt < self.max_retries - 1:
+                        time.sleep(self.retry_delay * (attempt + 1))
+                if not acquired:
+                    logger.warning(f"无法获取写入锁: {path}")
+                    return False
+
+                # 备份原文件（如果存在且需要备份）
+                backup_path = None
+                if backup and os.path.exists(path):
+                    backup_path = f"{path}.backup"
+                    try:
+                        shutil.copy2(path, backup_path)
+                        logger.debug(f"已备份文件: {backup_path}")
+                    except Exception as e:
+                        logger.warning(f"备份文件失败: {e}")
+                        backup_path = None
+
+                # 写入唯一临时文件；固定 .tmp 文件名在多进程写同一路径时会互相踩踏
+                temp_path = f"{path}.tmp.{os.getpid()}.{time.time_ns()}"
                 try:
-                    with open(temp_path, 'r', encoding='utf-8') as f:
-                        json.load(f)
-                except json.JSONDecodeError as e:
-                    logger.error(f"写入的JSON格式验证失败: {e}")
+                    with open(temp_path, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=4)
+                        try:
+                            f.flush()
+                            os.fsync(f.fileno())
+                        except Exception:
+                            pass
+
+                    # 验证临时文件的JSON格式
+                    try:
+                        with open(temp_path, 'r', encoding='utf-8') as f:
+                            json.load(f)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"写入的JSON格式验证失败: {e}")
+                        if backup_path and os.path.exists(backup_path):
+                            logger.info(f"从备份恢复: {backup_path}")
+                            shutil.copy2(backup_path, path)
+                        return False
+
+                    os.replace(temp_path, path)
+                    logger.debug(f"成功写入JSON文件: {path}")
+
+                    # 清理备份文件（可选）
+                    if backup_path and os.path.exists(backup_path):
+                        try:
+                            os.remove(backup_path)
+                        except Exception:
+                            pass
+
+                    return True
+
+                except Exception as e:
+                    logger.error(f"写入临时文件失败: {e}")
+                    # 清理临时文件
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+                    # 从备份恢复
                     if backup_path and os.path.exists(backup_path):
                         logger.info(f"从备份恢复: {backup_path}")
-                        shutil.copy2(backup_path, path)
+                        try:
+                            shutil.copy2(backup_path, path)
+                        except Exception:
+                            pass
                     return False
-                
-                # 原子替换（在Unix系统上是原子操作）
-                if os.name == 'nt':
-                    # Windows需要先删除原文件
-                    if os.path.exists(path):
-                        os.remove(path)
-                    os.rename(temp_path, path)
-                else:
-                    # Unix/Linux/Mac：rename是原子操作
-                    os.rename(temp_path, path)
-                
-                logger.debug(f"成功写入JSON文件: {path}")
-                
-                # 清理备份文件（可选）
-                if backup_path and os.path.exists(backup_path):
+            finally:
+                try:
+                    self._release_lock(lock_handle)
+                finally:
                     try:
-                        os.remove(backup_path)
+                        lock_handle.close()
                     except Exception:
                         pass
-                
-                return True
-                
-            except Exception as e:
-                logger.error(f"写入临时文件失败: {e}")
-                # 清理临时文件
-                if os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
-                # 从备份恢复
-                if backup_path and os.path.exists(backup_path):
-                    logger.info(f"从备份恢复: {backup_path}")
-                    try:
-                        shutil.copy2(backup_path, path)
-                    except Exception:
-                        pass
-                return False
                 
         except Exception as e:
             logger.error(f"写入JSON文件失败: {path}, 错误: {e}")
@@ -354,4 +372,3 @@ def safe_update_json(path: str, update_func: Callable[[Dict[str, Any]], Dict[str
                     default: Optional[Dict] = None) -> bool:
     """便捷函数：安全更新JSON文件"""
     return _json_manager.safe_update_json(path, update_func, default)
-
