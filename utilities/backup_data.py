@@ -93,6 +93,7 @@ def _sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def _write_manifest(target_dir: Path, archive_name: str, files: List[Path]) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
     entries = []
     for file in files:
         rel = file.relative_to(PROJECT_ROOT)
@@ -115,6 +116,7 @@ def _write_manifest(target_dir: Path, archive_name: str, files: List[Path]) -> N
 
 
 def _create_archive(target_dir: Path, files: List[Path]) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
     archive_path = target_dir / "backup.tar.gz"
     with tarfile.open(archive_path, "w:gz") as tar:
         for file in files:
@@ -239,5 +241,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 

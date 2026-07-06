@@ -17,6 +17,7 @@ load_dotenv()
 
 from utils.runtime_config import write_runtime_config_value
 from utils.backup_utils import run_backup_snapshot
+from utils.news_cache_guard import NewsCacheIntegrityError, validate_news_cache_integrity
 from agent_engine.agent.agent import AgenticWorkflow
 from utilities.prepare_benchmark_snapshots import prepare_benchmark_snapshots, should_prepare_snapshots
 from utilities.prefetch_historical_news import prefetch_historical_news
@@ -236,6 +237,14 @@ def validate_benchmark_startup(config, enabled_models):
         stock_path = Path(__file__).parent / stock_path
     if not stock_path.exists():
         errors.append(f"股票数据文件不存在: {stock_path}")
+
+    news_path = Path(data_config.get("news_csv_path", "./data_flow/news.csv"))
+    if not news_path.is_absolute():
+        news_path = Path(__file__).parent / news_path
+    try:
+        validate_news_cache_integrity(news_path, strict=True)
+    except NewsCacheIntegrityError as exc:
+        errors.append(f"新闻缓存完整性错误: {exc}")
 
     if should_prepare_snapshots() and not os.getenv("TSL_USER") and not os.getenv("TSL_USERNAME"):
         print("⚠️ 未检测到 TSL_USER/TSL_USERNAME；snapshot 准备将优先使用本地数据，缺数据时可能 fail-fast。")

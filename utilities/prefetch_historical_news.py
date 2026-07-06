@@ -19,6 +19,10 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from prompt_templates.prompts import DEFAULT_STOCK_SYMBOLS
+from utils.news_cache_guard import (
+    validate_news_cache_integrity,
+    write_news_manifest,
+)
 from utils.eastmoney_news import EASTMONEY_SEARCH_URL, _default_headers, _parse_json_or_jsonp
 from utils.position_manager import file_transaction_lock, normalize_symbol, strip_exchange_prefix
 from utils.tushare_config import get_tushare_pro
@@ -764,6 +768,8 @@ def _read_existing_news(path: Path) -> pd.DataFrame:
 
 def _save_news(path: Path, old_df: pd.DataFrame, new_rows: List[Dict[str, str]]) -> pd.DataFrame:
     with file_transaction_lock(path, suffix=".news.lock"):
+        if path.exists():
+            validate_news_cache_integrity(path, strict=True)
         current_old = old_df
         if path.exists() and path.stat().st_size > 0:
             for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
@@ -796,8 +802,14 @@ def _save_news(path: Path, old_df: pd.DataFrame, new_rows: List[Dict[str, str]])
         combined = combined.drop_duplicates(subset=["symbol", "_title_key", "_date_key"], keep="first")
         combined = combined.sort_values(["parsed_time", "symbol"], ascending=[False, True])
         combined = combined.drop(columns=["parsed_time", "_title_key", "_date_key", "_source_priority"])
+        if combined.empty:
+            if not current_old.empty:
+                print(f"refuse to overwrite non-empty news cache with empty result: {path}", flush=True)
+                return current_old
+            return combined
         path.parent.mkdir(parents=True, exist_ok=True)
         combined.to_csv(path, index=False, encoding="utf-8-sig")
+        write_news_manifest(path, combined)
         return combined
 
 

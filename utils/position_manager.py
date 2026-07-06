@@ -739,9 +739,20 @@ def upsert_position_record(modelname: str, record: Dict[str, Any]) -> None:
             action_symbol = normalize_symbol(action.get("symbol"))
             action["symbol"] = action_symbol or ""
 
+        clean_run_id = clean_record.get("ledger_run_id")
+        if clean_run_id:
+            matching_records_for_merge = [
+                matched for matched in matching_records
+                if matched.get("ledger_run_id") == clean_run_id
+            ]
+        else:
+            # Older records may not carry a run id. Preserve compatibility for
+            # those records while keeping new runs separated by run id.
+            matching_records_for_merge = matching_records
+
         merged_actions: List[Dict[str, Any]] = []
         merged_fills: List[Dict[str, Any]] = []
-        for matched in matching_records:
+        for matched in matching_records_for_merge:
             merged_actions.extend(_actions_from_record(matched))
             merged_fills.extend(_fills_from_record(matched))
         merged_actions.extend(_actions_from_record(clean_record))
@@ -784,7 +795,13 @@ def upsert_position_record(modelname: str, record: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-def add_no_trade_record(today_date: str, decision_time: str, decision_count: int, modelname: str):
+def add_no_trade_record(
+    today_date: str,
+    decision_time: str,
+    decision_count: int,
+    modelname: str,
+    ledger_run_id: Optional[str] = None,
+):
     """
     添加不交易记录。从 ../data_flow/trading_summary_each_agent/{modelname}/position/position.jsonl 中前一日最后一条持仓，并更新在今日的position.jsonl文件中。
     Args:
@@ -821,6 +838,8 @@ def add_no_trade_record(today_date: str, decision_time: str, decision_count: int
         "fills": [],
         "positions": sanitized_positions,
     }
+    if ledger_run_id:
+        save_item["ledger_run_id"] = ledger_run_id
 
     if latest_record and latest_record.get("decision_time") == decision_time:
         save_item["id"] = latest_record.get("id", current_action_id)

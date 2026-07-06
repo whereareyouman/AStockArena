@@ -26,6 +26,7 @@ except Exception:
     pass
 
 from prompt_templates.prompts import DEFAULT_STOCK_SYMBOLS
+from utils.news_cache_guard import validate_news_cache_integrity, write_news_manifest
 from utils.position_manager import file_transaction_lock
 from utils.tushare_config import TUSHARE_HTTP_URL, TUSHARE_TOKEN, get_tushare_module, get_tushare_pro
 
@@ -242,6 +243,8 @@ def _build_news_rows(
 
 def _append_news_csv(output_df: pd.DataFrame, news_csv_path: Path) -> pd.DataFrame:
     with file_transaction_lock(news_csv_path, suffix=".news.lock"):
+        if news_csv_path.exists():
+            validate_news_cache_integrity(news_csv_path, strict=True)
         if news_csv_path.exists() and news_csv_path.stat().st_size > 0:
             existing = pd.read_csv(news_csv_path, encoding="utf-8-sig")
         else:
@@ -255,6 +258,7 @@ def _append_news_csv(output_df: pd.DataFrame, news_csv_path: Path) -> pd.DataFra
         combined = combined.sort_values(["publish_time", "symbol"], ascending=[False, True], na_position="last")
         news_csv_path.parent.mkdir(parents=True, exist_ok=True)
         combined.to_csv(news_csv_path, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_MINIMAL)
+        write_news_manifest(news_csv_path, combined)
         return combined
 
 

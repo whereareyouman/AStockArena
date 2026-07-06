@@ -58,6 +58,7 @@ from data_manager import DataManager
 from agent_engine.shared_prefetch import SharedPrefetchCoordinator
 from utils.runtime_config import extract_llm_conversation, extract_llm_tool_messages, get_runtime_config_value, write_runtime_config_value
 from utils.json_file_manager import safe_read_json
+from utils.news_cache_guard import validate_news_cache_integrity, write_news_manifest
 from utils.position_manager import (
     add_no_trade_record,
     calculate_previous_trading_date,
@@ -69,6 +70,7 @@ from utils.position_manager import (
     remove_shares_from_lots,
     normalize_symbol,
     position_transaction_lock,
+    get_position_file_path,
     strip_exchange_prefix,
     summarize_lots,
     upsert_position_record,
@@ -345,7 +347,8 @@ class AgenticWorkflow:
         self.runtime_context: Dict[str, Any] = {
             "TODAY_DATE": None,
             "CURRENT_TIME": None,
-            "DECISION_COUNT": 0
+            "DECISION_COUNT": 0,
+            "LEDGER_RUN_ID": None,
         }
     
     def _reset_agent_storage(self) -> None:
@@ -415,8 +418,8 @@ class AgenticWorkflow:
             if not normalized:
                 continue
             raw_query = f"{strip_exchange_prefix(normalized) or normalized} 最新消息"
-            # Snapshot 构建必须是历史时点可复现的：只读已经下载到 news.csv 的新闻，
-            # 不在每个历史决策点触发 AKShare 实时请求，避免未来新闻污染和重复限流。
+            # Historical snapshot construction uses the prepared local news cache
+            # instead of issuing fresh web requests at each decision point.
             payload = self._read_news_csv_range(
                 normalized_symbol=normalized,
                 query=raw_query,
@@ -946,7 +949,12 @@ class AgenticWorkflow:
                 if filtered_df is None:
                     return
                 if len(filtered_df) != len(df):
+                    if filtered_df.empty:
+                        print(f"⚠️ 跳过新闻清理：过滤结果为空，拒绝用空表覆盖 {csv_path}")
+                        return
+                    validate_news_cache_integrity(Path(csv_path), strict=True)
                     filtered_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                    write_news_manifest(Path(csv_path), filtered_df)
                     print(f"🧹 已清理 {csv_path} 中的非白名单新闻记录")
     
     # --- 本地工具函数定义 (DM Functions) ---
@@ -1777,11 +1785,12 @@ class AgenticWorkflow:
     def add_no_trade_record_tool(self, today_date: str) -> str:
         """为当前代理在给定日期记录"无交易"操作。此函数更新代理的持仓文件以延续前一天的持仓。"""
         try:
-            # 优先使用实例上下文，避免并发状态污染
+            # Prefer instance-local context so concurrent runs do not share state.
             decision_time = self._get_context_value("CURRENT_TIME") or f"{today_date} 00:00:00"
             decision_count_raw = self._get_context_value("DECISION_COUNT")
             decision_count = int(decision_count_raw) if decision_count_raw is not None else 0
-            add_no_trade_record(today_date, decision_time, decision_count, self.signature)
+            ledger_run_id = self._get_context_value("LEDGER_RUN_ID")
+            add_no_trade_record(today_date, decision_time, decision_count, self.signature, ledger_run_id=ledger_run_id)
             return json.dumps({
                 "success": True,
                 "action": "no_trade",
@@ -2137,6 +2146,9 @@ class AgenticWorkflow:
                 "fills": [fill],
                 "positions": new_position
             }
+            ledger_run_id = self._get_context_value("LEDGER_RUN_ID")
+            if ledger_run_id:
+                record["ledger_run_id"] = ledger_run_id
             if latest_record and latest_record.get("decision_time") == decision_time:
                 record["id"] = latest_record.get("id")
             else:
@@ -2966,6 +2978,9 @@ class AgenticWorkflow:
                 "fills": [fill],
                 "positions": new_position
             }
+            ledger_run_id = self._get_context_value("LEDGER_RUN_ID")
+            if ledger_run_id:
+                record["ledger_run_id"] = ledger_run_id
             if latest_record and latest_record.get("decision_time") == decision_time:
                 record["id"] = latest_record.get("id")
             else:
@@ -3418,19 +3433,19 @@ class AgenticWorkflow:
         return None
 
     def _parse_llm_json_candidate(self, raw: str) -> Tuple[Optional[Any], Optional[str]]:
-        """Parse model-emitted JSON, repairing the common unescaped quote case once."""
+        """Parse model-emitted JSON and retry once after normalizing unescaped quotes."""
         try:
             return json.loads(raw), None
         except Exception as exc:
             first_error = f"json_parse_error: {exc}"
 
-        repaired = self._escape_unescaped_quotes_inside_json_strings(raw)
-        if repaired == raw:
+        normalized = self._escape_unescaped_quotes_inside_json_strings(raw)
+        if normalized == raw:
             return None, first_error
         try:
-            return json.loads(repaired), None
+            return json.loads(normalized), None
         except Exception as exc:
-            return None, f"{first_error}; repair_failed: {exc}"
+            return None, f"{first_error}; quote_normalization_failed: {exc}"
 
     def _escape_unescaped_quotes_inside_json_strings(self, raw: str) -> str:
         """Escape quote characters that appear inside JSON string values.
@@ -3528,10 +3543,25 @@ class AgenticWorkflow:
             if not isinstance(candidate_review, list) or not candidate_review:
                 missing.append("candidate_review.non_empty")
             else:
+                actions_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+                raw_actions = report.get("actions_planned_or_taken")
+                if isinstance(raw_actions, list):
+                    for action in raw_actions:
+                        if isinstance(action, dict) and action.get("symbol"):
+                            actions_by_symbol.setdefault(str(action.get("symbol")), []).append(action)
+
                 for idx, candidate in enumerate(candidate_review):
                     if not isinstance(candidate, dict):
                         missing.append(f"candidate_review[{idx}]")
                         continue
+                    if "risk_checks_mentioned" not in candidate:
+                        inferred_risk_checks: List[Any] = []
+                        for action in actions_by_symbol.get(str(candidate.get("symbol")), []):
+                            cited = action.get("risk_controls_cited")
+                            if isinstance(cited, list):
+                                inferred_risk_checks.extend(cited)
+                        candidate["risk_checks_mentioned"] = list(dict.fromkeys(inferred_risk_checks))
+                        warnings.append(f"candidate_review[{idx}].risk_checks_mentioned_inferred_from_actions")
                     for field in ("symbol", "rank", "selected_for_action", "news_evidence_used", "price_evidence_used", "risk_checks_mentioned"):
                         if field not in candidate:
                             missing.append(f"candidate_review[{idx}].{field}")
@@ -3576,6 +3606,9 @@ class AgenticWorkflow:
                     if not isinstance(action, dict):
                         missing.append(f"actions_planned_or_taken[{idx}]")
                         continue
+                    if "risk_controls_cited" not in action:
+                        action["risk_controls_cited"] = []
+                        warnings.append(f"actions_planned_or_taken[{idx}].risk_controls_cited_defaulted_empty")
                     for field in ("action", "reason_text", "risk_controls_cited"):
                         if field not in action:
                             missing.append(f"actions_planned_or_taken[{idx}].{field}")
@@ -3586,6 +3619,9 @@ class AgenticWorkflow:
             if not isinstance(workflow_trace, dict):
                 missing.append("workflow_trace")
             else:
+                if "missing_required_sections" not in workflow_trace:
+                    workflow_trace["missing_required_sections"] = []
+                    warnings.append("workflow_trace.missing_required_sections_defaulted_empty")
                 for field in (
                     "has_candidate_review",
                     "has_news_evidence",
@@ -3790,6 +3826,110 @@ class AgenticWorkflow:
         end = min(end_candidates) if end_candidates else len(text)
         return text[start:end].strip()
 
+    def _latest_ledger_record_for_decision(
+        self,
+        today_date: str,
+        decision_time: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the final position record for a decision point, if one exists."""
+        try:
+            position_file = get_position_file_path(self.signature)
+        except Exception:
+            return None
+        if not position_file.exists():
+            return None
+
+        target_time = normalize_decision_time(today_date, decision_time)
+        latest: Optional[Dict[str, Any]] = None
+        try:
+            with position_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except Exception:
+                        continue
+                    record_date = str(record.get("date") or "")
+                    record_time = normalize_decision_time(record_date, record.get("decision_time"))
+                    if record_date == today_date and record_time == target_time:
+                        latest = record
+        except Exception:
+            return None
+        return latest
+
+    def _format_model_action_lines(self, actions: Any) -> List[str]:
+        action_lines: List[str] = []
+        if not isinstance(actions, list):
+            actions = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_name = action.get("action", "unknown")
+            symbol = action.get("symbol") or ""
+            amount = action.get("amount")
+            reason = self._truncate_text(str(action.get("reason_text") or ""), 360)
+            suffix = f" {symbol}" if symbol else ""
+            if amount not in (None, "", 0):
+                suffix += f" x{amount}"
+            action_lines.append(f"- `{action_name}`{suffix}: {reason}")
+        if not action_lines:
+            action_lines.append("- (no structured model action captured)")
+        return action_lines
+
+    def _format_ledger_fill_lines(
+        self,
+        ledger_record: Optional[Dict[str, Any]],
+        fallback_model_action_lines: List[str],
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        if not ledger_record:
+            return (
+                [
+                    "- (ledger record not found; showing model-stated action below, not an executed fill)",
+                    *fallback_model_action_lines,
+                ],
+                {
+                    "ledger_record_found": False,
+                    "executed_fills": [],
+                    "ledger_warning": "position.jsonl record not found for this decision point",
+                },
+            )
+
+        fills = ledger_record.get("fills")
+        if not isinstance(fills, list):
+            fills = []
+        executed_fills = [fill for fill in fills if isinstance(fill, dict)]
+        lines: List[str] = []
+        for fill in executed_fills:
+            action = str(fill.get("action") or "unknown")
+            symbol = str(fill.get("symbol") or "")
+            amount = fill.get("amount", fill.get("shares", 0))
+            price = fill.get("price")
+            fees = []
+            if fill.get("commission") not in (None, "", 0):
+                fees.append(f"commission={fill.get('commission')}")
+            if fill.get("stamp_duty") not in (None, "", 0):
+                fees.append(f"stamp_duty={fill.get('stamp_duty')}")
+            fee_suffix = f" ({', '.join(fees)})" if fees else ""
+            price_suffix = f" @ {price}" if price not in (None, "") else ""
+            lines.append(f"- `{action}` {symbol} x{amount}{price_suffix}{fee_suffix}")
+
+        if not lines:
+            action = ledger_record.get("this_action") if isinstance(ledger_record, dict) else {}
+            action_name = action.get("action", "no_trade") if isinstance(action, dict) else "no_trade"
+            lines.append(f"- `{action_name or 'no_trade'}`: no executed buy/sell fill recorded in position ledger")
+
+        return (
+            lines,
+            {
+                "ledger_record_found": True,
+                "ledger_position_id": ledger_record.get("id"),
+                "ledger_decision_time": ledger_record.get("decision_time"),
+                "executed_fills": executed_fills,
+                "ledger_action": ledger_record.get("this_action"),
+            },
+        )
+
     def _write_decision_run_artifacts(
         self,
         *,
@@ -3832,12 +3972,19 @@ class AgenticWorkflow:
 
         report = (report_log_entry or {}).get("report") or {}
         actions = report.get("actions_planned_or_taken") if isinstance(report, dict) else []
+        model_action_lines = self._format_model_action_lines(actions)
+        ledger_record = self._latest_ledger_record_for_decision(today_date, decision_time)
+        ledger_action_lines, ledger_execution = self._format_ledger_fill_lines(
+            ledger_record,
+            model_action_lines,
+        )
         execution = {
             "signature": self.signature,
             "decision_time": decision_time,
             "decision_count": decision_count,
             "handled_trading_result": handled_trading_result,
             "actions_planned_or_taken": actions if isinstance(actions, list) else [],
+            **ledger_execution,
             "tool_summary": tool_summary,
             "tool_errors": list(dict.fromkeys(msg for msg in collected_tool_errors if msg)),
             "parse_success": (report_log_entry or {}).get("parse_success"),
@@ -3857,21 +4004,6 @@ class AgenticWorkflow:
                     news_items += int(payload.get("count") or len(payload.get("news") or []) or 0)
         price_symbols = len(snapshot_prices) if isinstance(snapshot_prices, dict) else 0
         indicator_symbols = len(snapshot_indicators) if isinstance(snapshot_indicators, dict) else 0
-
-        action_lines: List[str] = []
-        for action in execution["actions_planned_or_taken"]:
-            if not isinstance(action, dict):
-                continue
-            action_name = action.get("action", "unknown")
-            symbol = action.get("symbol") or ""
-            amount = action.get("amount")
-            reason = self._truncate_text(str(action.get("reason_text") or ""), 360)
-            suffix = f" {symbol}" if symbol else ""
-            if amount not in (None, "", 0):
-                suffix += f" x{amount}"
-            action_lines.append(f"- `{action_name}`{suffix}: {reason}")
-        if not action_lines:
-            action_lines.append("- (no structured action captured)")
 
         by_tool = (tool_metrics_entry or {}).get("by_tool") or {}
         if by_tool:
@@ -3913,10 +4045,14 @@ class AgenticWorkflow:
             "\n".join(tool_lines),
             "",
             "## Decision",
-            "\n".join(action_lines),
+            "\n".join(ledger_action_lines),
+            "",
+            "## Model-Stated Decision",
+            "\n".join(model_action_lines),
             "",
             "## Execution",
             f"- Trading result handled: {handled_trading_result}",
+            f"- Ledger record found: {execution.get('ledger_record_found')}",
             f"- Report status: {report_status}",
         ]
         if execution["tool_errors"]:
@@ -4728,6 +4864,10 @@ class AgenticWorkflow:
         self.runtime_context["TODAY_DATE"] = today_date
         self.runtime_context["CURRENT_TIME"] = current_time
         self.runtime_context["DECISION_COUNT"] = decision_count
+        self.runtime_context["LEDGER_RUN_ID"] = (
+            f"{self.signature}:{normalize_decision_time(today_date, current_time)}:"
+            f"{os.getpid()}:{time.time_ns()}"
+        )
 
         # Set up logging
         log_file = self._setup_logging(today_date, current_time)
@@ -5038,6 +5178,8 @@ class AgenticWorkflow:
                     should_handle_trading_result = False
                     raise DecisionEvidenceReportError(reason)
         except Exception as e:
+            if not get_runtime_config_value("IF_TRADE"):
+                should_handle_trading_result = False
             print(f"❌ Trading session error: {str(e)}")
             print(f"Error details: {e}")
             import traceback
@@ -5148,7 +5290,14 @@ class AgenticWorkflow:
         else:
             print("📊 No trading, maintaining positions")
             try:
-                add_no_trade_record(today_date, decision_time, decision_count, self.signature)
+                ledger_run_id = self._get_context_value("LEDGER_RUN_ID")
+                add_no_trade_record(
+                    today_date,
+                    decision_time,
+                    decision_count,
+                    self.signature,
+                    ledger_run_id=ledger_run_id,
+                )
             except NameError as e:
                 print(f"❌ NameError: {e}")
                 raise

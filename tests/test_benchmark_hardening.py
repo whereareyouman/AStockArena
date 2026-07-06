@@ -26,6 +26,11 @@ import utilities.live_scheduler as live_scheduler
 import utilities.prefetch_historical_news as prefetch_historical_news
 import utils.backup_utils as backup_utils
 from utils.json_file_manager import JsonFileManager
+from utils.news_cache_guard import (
+    NewsCacheIntegrityError,
+    validate_news_cache_integrity,
+    write_news_manifest,
+)
 from utilities.live_scheduler import _event_for, build_tick_config, next_pending_event, retry_attempts, write_error_artifacts
 from utils.position_manager import (
     get_available_sell_shares,
@@ -183,13 +188,71 @@ def test_position_upsert_merges_actions_for_same_decision_time(tmp_path, monkeyp
             "positions": {"CASH": 899970, "SH688256": {"shares": 100, "purchase_date": "2026-03-02", "avg_price": 1000}},
         },
     )
+    upsert_position_record(
+        "model-a",
+        {
+            "date": "2026-03-02",
+            "decision_time": "2026-03-02 10:30:00",
+            "decision_count": 1,
+            "this_action": {"action": "no_trade", "symbol": "", "amount": 0},
+            "actions": [{"action": "no_trade", "symbol": "", "amount": 0}],
+            "fills": [],
+            "positions": {"CASH": 899970, "SH688256": {"shares": 100, "purchase_date": "2026-03-02", "avg_price": 1000}},
+        },
+    )
 
     position_file = project_root / "data_flow" / "trading_summary_each_agent" / "model-a" / "position" / "position.jsonl"
     rows = [json.loads(line) for line in position_file.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(rows) == 1
     assert rows[0]["this_action"] == {"action": "buy", "symbol": "SH688256", "amount": 100}
-    assert [action["action"] for action in rows[0]["actions"]] == ["buy", "no_trade"]
+    assert [action["action"] for action in rows[0]["actions"]] == ["buy", "no_trade", "no_trade"]
     assert len(rows[0]["fills"]) == 1
+
+
+def test_position_upsert_does_not_carry_fills_across_rerun_ids(tmp_path, monkeypatch):
+    project_root = tmp_path / "repo"
+    settings = project_root / "settings"
+    settings.mkdir(parents=True)
+    (settings / "default_config.json").write_text(
+        json.dumps({"log_config": {"log_path": "./data_flow/trading_summary_each_agent"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("utils.position_manager.__file__", str(project_root / "utils" / "position_manager.py"))
+
+    upsert_position_record(
+        "model-a",
+        {
+            "date": "2026-04-07",
+            "decision_time": "2026-04-07 11:30:00",
+            "decision_count": 2,
+            "ledger_run_id": "old-run",
+            "this_action": {"action": "buy", "symbol": "SH688256", "amount": 100},
+            "actions": [{"action": "buy", "symbol": "SH688256", "amount": 100}],
+            "fills": [{"action": "buy", "symbol": "SH688256", "amount": 100}],
+            "positions": {"CASH": 880000, "SH688256": {"shares": 100, "purchase_date": "2026-04-07", "avg_price": 1200}},
+        },
+    )
+    upsert_position_record(
+        "model-a",
+        {
+            "date": "2026-04-07",
+            "decision_time": "2026-04-07 11:30:00",
+            "decision_count": 2,
+            "ledger_run_id": "new-run",
+            "this_action": {"action": "no_trade", "symbol": "", "amount": 0},
+            "actions": [{"action": "no_trade", "symbol": "", "amount": 0}],
+            "fills": [],
+            "positions": {"CASH": 1000000},
+        },
+    )
+
+    position_file = project_root / "data_flow" / "trading_summary_each_agent" / "model-a" / "position" / "position.jsonl"
+    rows = [json.loads(line) for line in position_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["ledger_run_id"] == "new-run"
+    assert rows[0]["this_action"] == {"action": "no_trade", "symbol": "", "amount": 0}
+    assert rows[0]["fills"] == []
+    assert rows[0]["positions"] == {"CASH": 1000000}
 
 
 def test_serialized_position_tool_preserves_parallel_same_turn_trades(tmp_path, monkeypatch):
@@ -341,9 +404,11 @@ def test_ordered_trading_tool_node_async_runs_position_tools_in_call_order():
 def test_startup_key_validation_routes_by_provider(monkeypatch, tmp_path):
     stock_path = tmp_path / "ai_stock_data.json"
     stock_path.write_text("{}", encoding="utf-8")
+    news_path = tmp_path / "news.csv"
+    news_path.write_text("symbol,title,content,publish_time,source,url,query,search_time\n", encoding="utf-8")
     config = {
         "date_range": {"init_date": "2026-01-12", "end_date": "2026-01-13"},
-        "data_config": {"stock_json_path": str(stock_path)},
+        "data_config": {"stock_json_path": str(stock_path), "news_csv_path": str(news_path)},
     }
     models = [
         {"basemodel": "deepseek/deepseek-v3.1-terminus", "openai_base_url": "https://openrouter.ai/api/v1"},
@@ -500,9 +565,44 @@ def test_historical_news_save_dedupes_cross_source_by_title_date(tmp_path):
     )
 
     assert len(saved) == 2
+    manifest = json.loads((tmp_path / "news_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rows"] == 2
+    assert manifest["sha256"]
     duplicate = saved[saved["title"].str.contains("业绩说明会", na=False)].iloc[0]
     assert duplicate["source"] == "sse_announcement"
     assert duplicate["url"] == "http://sse"
+
+
+def test_news_cache_guard_rejects_empty_csv_with_nonempty_manifest(tmp_path):
+    news_path = tmp_path / "news.csv"
+    news_path.write_text("symbol,title,content,publish_time,source,url,query,search_time\n", encoding="utf-8")
+    (tmp_path / "news_manifest.json").write_text(
+        json.dumps({"rows": 9176, "size_bytes": 4262708, "sha256": "expected"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = validate_news_cache_integrity(news_path)
+
+    assert result["ok"] is False
+    assert any("只有表头" in error for error in result["errors"])
+    with pytest.raises(NewsCacheIntegrityError):
+        validate_news_cache_integrity(news_path, strict=True)
+
+
+def test_news_purge_refuses_to_overwrite_nonempty_cache_with_empty_filter(tmp_path):
+    news_path = tmp_path / "news.csv"
+    original = (
+        "symbol,title,content,publish_time,source,url,query,search_time\n"
+        "SH600000,other,body,2026-04-01 10:00:00,sina,,,\n"
+    )
+    news_path.write_text(original, encoding="utf-8")
+    write_news_manifest(news_path)
+    agent = object.__new__(AgenticWorkflow)
+    agent.allowed_symbols = {"SH688981"}
+
+    agent._purge_news_csv(str(news_path))
+
+    assert news_path.read_text(encoding="utf-8") == original
 
 
 def test_strict_snapshot_mode_accepts_legacy_env(monkeypatch):
@@ -516,7 +616,7 @@ def test_strict_snapshot_mode_accepts_legacy_env(monkeypatch):
     assert agent._strict_snapshot_mode() is True
 
 
-def test_decision_report_parser_repairs_unescaped_news_quotes():
+def test_decision_report_parser_handles_unescaped_news_quotes():
     agent = object.__new__(AgenticWorkflow)
     content = '''```json
 {
@@ -1098,6 +1198,96 @@ def test_decision_run_artifacts_include_readable_markdown(tmp_path):
     by_name = {item["filename"]: item for item in manifest["artifacts"]}
     assert by_name["conversation.jsonl"]["complete_raw"] is True
     assert by_name["readable.md"]["summary_view"] is True
+
+
+def test_decision_readable_uses_ledger_fills_for_executed_decision(tmp_path, monkeypatch):
+    project_root = tmp_path / "repo"
+    settings = project_root / "settings"
+    settings.mkdir(parents=True)
+    (settings / "default_config.json").write_text(
+        json.dumps({"log_config": {"log_path": "./data_flow/trading_summary_each_agent"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("utils.position_manager.__file__", str(project_root / "utils" / "position_manager.py"))
+
+    position_dir = project_root / "data_flow" / "trading_summary_each_agent" / "test-model" / "position"
+    position_dir.mkdir(parents=True)
+    (position_dir / "position.jsonl").write_text(
+        json.dumps(
+            {
+                "id": 7,
+                "date": "2026-06-16",
+                "decision_time": "2026-06-16 14:00:00",
+                "this_action": {"action": "sell", "symbol": "SH688981", "amount": 300},
+                "actions": [{"action": "sell", "symbol": "SH688981", "amount": 300}],
+                "fills": [
+                    {
+                        "action": "sell",
+                        "symbol": "SH688981",
+                        "amount": 300,
+                        "price": 100,
+                        "commission": 9,
+                        "stamp_duty": 30,
+                    }
+                ],
+                "positions": {"CASH": 1000},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    agent = AgenticWorkflow.__new__(AgenticWorkflow)
+    agent.signature = "test-model"
+    agent.base_log_path = str(tmp_path / "runs")
+
+    agent._write_decision_run_artifacts(
+        today_date="2026-06-16",
+        decision_time="2026-06-16 14:00:00",
+        decision_count=3,
+        input_payload={"cash": 1000, "total_equity": 1000, "snapshot": {"snapshot_path": "/tmp/snapshot.json"}},
+        full_conversation_entry={"messages": []},
+        tool_metrics_entry={"by_tool": {}, "calls": []},
+        report_log_entry={
+            "parse_success": True,
+            "schema_valid": True,
+            "report": {
+                "actions_planned_or_taken": [
+                    {"action": "buy", "symbol": "SH688008", "amount": 100, "reason_text": "model plan"}
+                ]
+            },
+        },
+        final_agent_summary="Observation Summary:\n\nok",
+        tool_summary="ok",
+        collected_tool_errors=[],
+        handled_trading_result=True,
+    )
+
+    readable = (
+        tmp_path
+        / "runs"
+        / "test-model"
+        / "runs"
+        / "2026-06-16"
+        / "14-00-00"
+        / "readable.md"
+    ).read_text(encoding="utf-8")
+    assert "## Decision\n- `sell` SH688981 x300 @ 100" in readable
+    assert "## Model-Stated Decision\n- `buy` SH688008 x100: model plan" in readable
+    execution = json.loads(
+        (
+            tmp_path
+            / "runs"
+            / "test-model"
+            / "runs"
+            / "2026-06-16"
+            / "14-00-00"
+            / "execution.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert execution["ledger_record_found"] is True
+    assert execution["executed_fills"][0]["symbol"] == "SH688981"
 
 
 def test_snapshot_price_used_for_portfolio_metrics():
@@ -1798,6 +1988,71 @@ def test_benchmark_decision_report_schema_validation_flags_missing_sections():
     assert "candidate_review" in validation["missing_required_sections"]
     assert "workflow_trace" in validation["missing_required_sections"]
     assert "actions_planned_or_taken.non_empty" in validation["missing_required_sections"]
+
+
+def test_decision_report_validation_defaults_optional_risk_check_lists():
+    agent = AgenticWorkflow(
+        signature="test-agent",
+        basemodel="test-model",
+        stock_symbols=["SH600519"],
+        stock_json_path="./data_flow/ai_stock_data.json",
+        news_csv_path="./data_flow/news.csv",
+        openai_api_key="test",
+        init_date="2026-01-12",
+    )
+
+    report = {
+        "schema_version": 2,
+        "observed_universe": ["SH600519"],
+        "candidate_review": [
+            {
+                "symbol": "SH600519",
+                "rank": 1,
+                "selected_for_action": True,
+                "news_evidence_used": [
+                    {
+                        "title": "positive news",
+                        "model_interpretation": "positive",
+                        "claimed_direction": "positive",
+                    }
+                ],
+                "price_evidence_used": {
+                    "signal_evaluation": {
+                        "momentum_reading": "bullish",
+                        "trend_reading": "bullish",
+                        "risk_reading": "acceptable",
+                        "momentum_trend_conflict": False,
+                        "decision_implication": "supports_entry",
+                    }
+                },
+                "buy_reason_text": "buy",
+                "reject_or_hold_reason_text": "",
+            }
+        ],
+        "actions_planned_or_taken": [
+            {
+                "action": "buy",
+                "symbol": "SH600519",
+                "reason_text": "buy",
+                "risk_controls_cited": ["cash", "position_limit"],
+            }
+        ],
+        "workflow_trace": {
+            "has_candidate_review": True,
+            "has_news_evidence": True,
+            "has_price_evidence": True,
+            "has_risk_checks": True,
+            "has_action_reason": True,
+        },
+    }
+
+    validation = agent._validate_benchmark_decision_report(report)
+
+    assert validation["schema_valid"] is True
+    assert report["candidate_review"][0]["risk_checks_mentioned"] == ["cash", "position_limit"]
+    assert report["workflow_trace"]["missing_required_sections"] == []
+    assert "candidate_review[0].risk_checks_mentioned_inferred_from_actions" in validation["schema_warnings"]
+    assert "workflow_trace.missing_required_sections_defaulted_empty" in validation["schema_warnings"]
 
 
 def test_decision_report_parser_recovers_json_inside_fenced_block_with_intro():

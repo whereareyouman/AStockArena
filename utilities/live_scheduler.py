@@ -41,6 +41,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import main as trading_main
 from agent_engine.agent.agent import AgenticWorkflow
 from agent_engine.shared_prefetch import _FileLock
+from utils.news_cache_guard import NewsCacheIntegrityError, validate_news_cache_integrity
 from utils.position_manager import normalize_symbol
 
 
@@ -596,6 +597,10 @@ def _validate_snapshot_payload(agent: AgenticWorkflow, payload: Dict[str, Any]) 
 def prepare_snapshot_for_event(config: Dict[str, Any], event: DecisionEvent) -> Dict[str, Any]:
     if not _truthy((config.get("run_config") or {}).get("live_snapshot_before_models"), default=True):
         return {"skipped": True}
+    news_path = Path((config.get("data_config") or {}).get("news_csv_path", "./data_flow/news.csv"))
+    if not news_path.is_absolute():
+        news_path = PROJECT_ROOT / news_path
+    validate_news_cache_integrity(news_path, strict=True)
     agent = _snapshot_agent(config, event)
     try:
         symbols_signature = agent._symbols_signature()
@@ -1228,6 +1233,17 @@ def run_doctor(config_path: Optional[str] = None) -> int:
     if not news_path.is_absolute():
         news_path = PROJECT_ROOT / news_path
     checks.append(("news.csv exists", news_path.exists(), str(news_path)))
+    try:
+        news_integrity = validate_news_cache_integrity(news_path, strict=False)
+        detail = (
+            f"rows={news_integrity.get('rows')} size={news_integrity.get('size_bytes')} "
+            f"manifest={news_integrity.get('manifest_exists')}"
+        )
+        if news_integrity.get("errors"):
+            detail += f" errors={news_integrity.get('errors')}"
+        checks.append(("news.csv manifest integrity", bool(news_integrity.get("ok")), detail))
+    except NewsCacheIntegrityError as exc:
+        checks.append(("news.csv manifest integrity", False, str(exc)))
     next_event = next_pending_event(config, {"events": {}}, _now_cn())
     checks.append(("next event", next_event is not None, next_event.decision_time if next_event else "none"))
 
