@@ -4,6 +4,9 @@ Create a timestamped backup of all critical trading data_flow.
 
 Backed-up assets:
   - data_flow/trading_summary_each_agent/**        (all model logs and positions)
+  - data_flow/agent_data/shared/snapshots/**       (shared market/news inputs)
+  - data_flow/pnl_snapshots/**                     (per-decision equity series)
+  - data_flow/benchmark_reports/**                 (benchmark summaries)
   - data_flow/news.csv             (latest news cache)
   - data_flow/ai_stock_data.json   (hourly price cache)
   - settings/runtime/*.json    (per-model runtime state)
@@ -55,6 +58,9 @@ def _collect_targets() -> Tuple[List[Path], List[Path]]:
     """Return (files, missing_paths)."""
     include_dirs = [
         PROJECT_ROOT / "data_flow" / "trading_summary_each_agent",
+        PROJECT_ROOT / "data_flow" / "agent_data" / "shared" / "snapshots",
+        PROJECT_ROOT / "data_flow" / "pnl_snapshots",
+        PROJECT_ROOT / "data_flow" / "benchmark_reports",
         PROJECT_ROOT / "settings",
     ]
     include_files = [
@@ -241,4 +247,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

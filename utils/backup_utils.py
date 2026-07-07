@@ -161,11 +161,93 @@ def save_pnl_snapshot(reason: str) -> bool:
             legacy = agent_data_root / "default" / "position.jsonl"
             return legacy if legacy.exists() else None
 
+        def _price_from_snapshot_payload(payload: Any) -> float:
+            if not isinstance(payload, dict):
+                try:
+                    return float(payload or 0)
+                except Exception:
+                    return 0.0
+            summary = payload.get("summary")
+            if isinstance(summary, dict):
+                try:
+                    price = float(summary.get("close") or 0)
+                    if price > 0:
+                        return price
+                except Exception:
+                    pass
+            points = payload.get("prices_3d")
+            if isinstance(points, list):
+                for point in reversed(points):
+                    if not isinstance(point, dict):
+                        continue
+                    try:
+                        price = float(point.get("close") or 0)
+                        if price > 0:
+                            return price
+                    except Exception:
+                        continue
+            hourly = payload.get("hourly_3d")
+            candles = hourly.get("candles") if isinstance(hourly, dict) else None
+            if isinstance(candles, list):
+                for point in reversed(candles):
+                    if not isinstance(point, dict):
+                        continue
+                    try:
+                        price = float(point.get("close") or 0)
+                        if price > 0:
+                            return price
+                    except Exception:
+                        continue
+            return 0.0
+
+        def _get_shared_snapshot_price(symbol: str, decision_time: str = None, date_str: str = None) -> float:
+            if not decision_time and not date_str:
+                return 0.0
+            target = decision_time or (f"{date_str} 15:00:00" if date_str else "")
+            date_part = (date_str or target[:10] or "").strip()
+            if not date_part:
+                return 0.0
+            snapshot_dir = PROJECT_ROOT / "data_flow" / "agent_data" / "shared" / "snapshots" / date_part
+            if not snapshot_dir.exists():
+                return 0.0
+
+            best_payload: Optional[Dict[str, Any]] = None
+            best_time = ""
+            for path in sorted(snapshot_dir.glob("*.json")):
+                try:
+                    with path.open("r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                snap_time = str(payload.get("decision_time") or "")
+                if target and snap_time and snap_time > target:
+                    continue
+                if snap_time >= best_time:
+                    best_time = snap_time
+                    best_payload = payload
+
+            if not best_payload:
+                return 0.0
+            prices = best_payload.get("prices")
+            if not isinstance(prices, dict):
+                return 0.0
+            symbol_upper = symbol.upper()
+            for key in (symbol_upper, symbol_upper.replace("SH", "").replace("SZ", "")):
+                if key in prices:
+                    return _price_from_snapshot_payload(prices[key])
+            return 0.0
+
         def _get_price_at_time(symbol: str, decision_time: str = None, date_str: str = None) -> float:
             """
             根据决策时点获取股票价格。
-            从 ai_stock_data.json 中查找 <= decision_time 的最新价格。
+            优先使用本轮 shared snapshot；缺失时才回退到 ai_stock_data.json。
             """
+            snapshot_price = _get_shared_snapshot_price(symbol, decision_time, date_str)
+            if snapshot_price > 0:
+                return snapshot_price
+
             stock_data_path = PROJECT_ROOT / "data_flow" / "ai_stock_data.json"
             if not stock_data_path.exists():
                 return 0.0
@@ -215,9 +297,7 @@ def save_pnl_snapshot(reason: str) -> bool:
                 if best_match:
                     return float(best_match.get("close") or best_match.get("buy1") or 0)
                 
-                # 如果找不到，返回第一条记录的价格（最早的价格）
-                first_item = data_list[0]
-                return float(first_item.get("close") or first_item.get("buy1") or 0)
+                return 0.0
                 
             except Exception:
                 return 0.0
