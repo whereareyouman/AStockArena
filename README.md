@@ -665,7 +665,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Prof. Jie ZHANG** - HKUST
 
 ### Student Contributors
-- **Research Postgraduate**: Zeyu LIU (MPhil)
+- **Research Postgraduate**: Zeyu LIU (PhD)
 - **Undergraduates**: Sing Kwong LAI, Zihao FANG, Yiqing GE, Jitong ZHANG, Jinwan KIM
 
 ### Technical Support
