@@ -349,6 +349,7 @@ class AgenticWorkflow:
             "CURRENT_TIME": None,
             "DECISION_COUNT": 0,
             "LEDGER_RUN_ID": None,
+            "SUBMITTED_DECISION_EVIDENCE_REPORT": None,
         }
     
     def _reset_agent_storage(self) -> None:
@@ -1801,6 +1802,27 @@ class AgenticWorkflow:
         except Exception as e:
             return json.dumps({"error": f"添加无交易记录时出错: {str(e)}"})
 
+    def submit_decision_evidence_report(self, decision_evidence_report: Dict[str, Any]) -> str:
+        """提交本次决策的结构化审计报告。只保存模型显式提交的 report，不推断或改写交易理由。"""
+        try:
+            if not isinstance(decision_evidence_report, dict):
+                return json.dumps({
+                    "success": False,
+                    "error": "decision_evidence_report must be an object"
+                }, ensure_ascii=False)
+
+            report = copy.deepcopy(decision_evidence_report)
+            validation = self._validate_benchmark_decision_report(report)
+            self.runtime_context["SUBMITTED_DECISION_EVIDENCE_REPORT"] = report
+            return json.dumps({
+                "success": bool(validation.get("schema_valid")),
+                "schema_valid": bool(validation.get("schema_valid")),
+                "missing_required_sections": validation.get("missing_required_sections", []),
+                "schema_warnings": validation.get("schema_warnings", []),
+            }, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"success": False, "error": f"提交审计报告时出错: {str(e)}"}, ensure_ascii=False)
+
     def _get_prefetched_trade_price(self, normalized_symbol: str) -> Tuple[Optional[float], Optional[str]]:
         """
         从共享 prefetch snapshot 中取该股票在“当前决策锚点”对应的价格，用于交易执行。
@@ -3020,7 +3042,8 @@ class AgenticWorkflow:
                 tool(self.get_current_position_tool),
                 tool(self.add_no_trade_record_tool),
                 tool(self.buy_stock),
-                tool(self.sell_stock)
+                tool(self.sell_stock),
+                tool(self.submit_decision_evidence_report)
             ]
             print(f"✅ 已加载 {len(self.tools)} 个本地工具（所有工具已整合历史+实时数据）")
         else:
@@ -3353,6 +3376,8 @@ class AgenticWorkflow:
         candidates: List[str] = []
         fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)```", content, flags=re.IGNORECASE | re.DOTALL)
         for block in fenced_blocks:
+            if any(marker in block for marker in markers):
+                candidates.append(block.strip())
             candidates.extend(self._json_object_candidates(block, markers))
         candidates.extend(self._json_object_candidates(content, markers))
 
@@ -3434,18 +3459,126 @@ class AgenticWorkflow:
 
     def _parse_llm_json_candidate(self, raw: str) -> Tuple[Optional[Any], Optional[str]]:
         """Parse model-emitted JSON and retry once after normalizing unescaped quotes."""
-        try:
-            return json.loads(raw), None
-        except Exception as exc:
-            first_error = f"json_parse_error: {exc}"
+        candidates: List[Tuple[str, str]] = [("raw", raw)]
+        title_repaired = self._repair_title_quote_before_colon(raw)
+        if title_repaired != raw:
+            candidates.append(("title_quote_before_colon_repair", title_repaired))
+        structural = self._repair_candidate_field_closure(raw)
+        if structural != raw:
+            candidates.append(("candidate_field_closure_repair", structural))
+        if title_repaired != raw:
+            title_structural = self._repair_candidate_field_closure(title_repaired)
+            if title_structural != title_repaired and title_structural != structural:
+                candidates.append(("title_quote_before_colon_repair+candidate_field_closure_repair", title_structural))
+        timestamp_repaired = self._repair_timestamp_missing_closing_quote(raw)
+        if timestamp_repaired != raw:
+            candidates.append(("timestamp_quote_repair", timestamp_repaired))
+        if structural != raw:
+            structural_timestamp_repaired = self._repair_timestamp_missing_closing_quote(structural)
+            if structural_timestamp_repaired != structural and structural_timestamp_repaired != timestamp_repaired:
+                candidates.append(("candidate_field_closure_repair+timestamp_quote_repair", structural_timestamp_repaired))
 
-        normalized = self._escape_unescaped_quotes_inside_json_strings(raw)
-        if normalized == raw:
-            return None, first_error
-        try:
-            return json.loads(normalized), None
-        except Exception as exc:
-            return None, f"{first_error}; quote_normalization_failed: {exc}"
+        first_error: Optional[str] = None
+        errors: List[str] = []
+        seen: set[str] = set()
+        for label, candidate in candidates:
+            for variant_label, variant in (
+                (label, candidate),
+                (f"{label}+quote_normalization", self._escape_unescaped_quotes_inside_json_strings(candidate)),
+            ):
+                if variant in seen:
+                    continue
+                seen.add(variant)
+                try:
+                    return json.loads(variant), None
+                except Exception as exc:
+                    message = f"{variant_label}: {exc}"
+                    errors.append(message)
+                    if first_error is None:
+                        first_error = f"json_parse_error: {exc}"
+        return None, (first_error or "json_parse_error") + "; repair_failed: " + " | ".join(errors[-3:])
+
+    def _repair_candidate_field_closure(self, raw: str) -> str:
+        """Repair a common LLM JSON mistake around candidate-level fields.
+
+        Some outputs close ``price_evidence_used`` and then accidentally close the
+        whole candidate before emitting ``risk_checks_mentioned`` or reason fields:
+
+            "model_price_reading": "..."
+            }
+          },
+          "risk_checks_mentioned": [...]
+
+        The field clearly belongs to the same candidate. This pass removes only
+        that premature candidate close; it does not invent any content.
+        """
+        import re
+
+        repaired = re.sub(
+            r'(\n\s*},\s*)\n\s*},\s*\n(\s*"(?:risk_checks_mentioned|buy_reason_text|reject_or_hold_reason_text)"\s*:)',
+            r"\1\n\2",
+            self._repair_redundant_candidate_close(raw),
+        )
+        repaired = re.sub(
+            r'(\n\s*}\s*)\n\s*},\s*\n(\s*"(?:risk_checks_mentioned|buy_reason_text|reject_or_hold_reason_text)"\s*:)',
+            r"\1,\n\2",
+            repaired,
+        )
+        repaired = re.sub(
+            r'(\n\s*]\s*)\n\s*},\s*\n(\s*"(?:risk_checks_mentioned|buy_reason_text|reject_or_hold_reason_text)"\s*:)',
+            r"\1,\n\2",
+            repaired,
+        )
+        return re.sub(
+            r'(\n\s*"(?:current_position|current_unrealized_pnl|position_pnl_pct|position_status|text_summary|momentum_trend_conflict|concept_driver|available_to_sell)"\s*:[^\n]+)\s*\n\s*},\s*\n(\s*"(?:risk_checks_mentioned|buy_reason_text|reject_or_hold_reason_text)"\s*:)',
+            r"\1,\n\2",
+            repaired,
+        )
+
+    def _repair_redundant_candidate_close(self, raw: str) -> str:
+        """Remove one extra candidate close before the next candidate object.
+
+        Some reports contain:
+
+            "reject_or_hold_reason_text": ""
+            }
+          },
+          {
+            "symbol": "..."
+
+        The middle ``},`` is the intended candidate delimiter; the previous
+        ``}`` already closed the candidate. Convert the previous close into the
+        delimiter and remove the redundant line.
+        """
+        import re
+
+        return re.sub(
+            r'(\n)(\s*)}\s*\n\s*},\s*\n(\s*\{\s*\n\s*"symbol"\s*:)',
+            r"\1\2},\n\3",
+            re.sub(
+                r'(\n\s*})\s*\n\s*}\s*\n(\s*],\s*\n\s*"actions_planned_or_taken"\s*:)',
+                r"\1\n\2",
+                raw,
+            ),
+        )
+
+    def _repair_timestamp_missing_closing_quote(self, raw: str) -> str:
+        """Repair a narrowly-scoped missing quote in timestamp string fields.
+
+        Example:
+            "publish_time": "2026-04-07 11:13,
+            "source": "snapshot"
+
+        This only applies to known timestamp keys followed by a date/time-shaped
+        value and the next JSON key. It does not rewrite arbitrary strings.
+        """
+        import re
+
+        return re.sub(
+            r'("(?:publish_time|decision_time)"\s*:\s*"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?),(\s*\n\s*")',
+            r'\1",\2',
+            raw,
+        )
 
     def _escape_unescaped_quotes_inside_json_strings(self, raw: str) -> str:
         """Escape quote characters that appear inside JSON string values.
@@ -3491,7 +3624,33 @@ class AgenticWorkflow:
                 continue
             result.append(ch)
 
-        return "".join(result) if changed else raw
+        normalized = "".join(result) if changed else raw
+        normalized = self._repair_title_quote_before_colon(normalized)
+        return self._repair_overescaped_json_keys(normalized)
+
+    def _repair_overescaped_json_keys(self, raw: str) -> str:
+        """Undo quote normalization when it escaped the start of a JSON key."""
+        import re
+
+        return re.sub(
+            r'(,\s*\n\s*)\\"([A-Za-z_][A-Za-z0-9_]*)"\s*:',
+            r'\1"\2":',
+            re.sub(
+                r']"\s*,\s*\n(\s*)\\"([A-Za-z_][A-Za-z0-9_]*)"\s*:',
+                r'],\n\1"\2":',
+                raw,
+            ),
+        )
+
+    def _repair_title_quote_before_colon(self, raw: str) -> str:
+        """Escape a quote-colon sequence inside a news title string value."""
+        import re
+
+        return re.sub(
+            r'("title"\s*:\s*"(?:(?:\\"|[^"\n])*)?)"(?=:[^,\n]*",)',
+            r'\1\\"',
+            raw,
+        )
 
     def _latest_decision_report_content_from_conversation(self, conversation: Any) -> Optional[str]:
         """Return the latest assistant message that actually contains the evidence report."""
@@ -3514,6 +3673,96 @@ class AgenticWorkflow:
             content = self._content_to_text(self._message_field(message, "content", ""))
             if '"decision_evidence_report"' in content or '"benchmark_decision_report"' in content:
                 return content
+        return None
+
+    async def _recover_decision_report_only(
+        self,
+        *,
+        log_file: str,
+        context_message: str,
+        final_agent_summary: Optional[str],
+        tool_summary: str,
+        decision_time: str,
+        decision_count: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Ask the same model to submit only the missing audit report.
+
+        The recovery agent receives only the non-mutating report submission tool,
+        so this cannot place duplicate buy/sell/no-trade ledger actions.
+        """
+        self.runtime_context["SUBMITTED_DECISION_EVIDENCE_REPORT"] = None
+        recovery_prompt = (
+            "You failed to submit the required auditable decision_evidence_report.\n"
+            "Do not make a new trading decision. Do not call buy_stock, sell_stock, or no_trade tools.\n"
+            "Based only on the original task, your prior analysis, and the tool results below, "
+            "submit exactly one decision_evidence_report by calling submit_decision_evidence_report.\n"
+            "If the prior decision was active waiting/no_trade, include one actions_planned_or_taken item "
+            "with action='no_trade', symbol='', amount=0, and a concrete reason_text.\n"
+            "Required report fields: schema_version=2, signature, date, decision_time, decision_count, "
+            "observed_universe, candidate_review, actions_planned_or_taken, workflow_trace.\n"
+            "Every candidate_review item must include symbol, rank, selected_for_action, news_evidence_used, "
+            "price_evidence_used, risk_checks_mentioned, buy_reason_text, reject_or_hold_reason_text. "
+            "Every price_evidence_used.signal_evaluation must include momentum_reading, trend_reading, "
+            "risk_reading, momentum_trend_conflict, decision_implication.\n\n"
+            "Original task:\n"
+            f"{context_message}\n\n"
+            "Prior model response:\n"
+            f"{final_agent_summary or '(no final response captured)'}\n\n"
+            "Tool results summary:\n"
+            f"{tool_summary or '(no tool output)'}"
+        )
+        recovery_agent = create_react_agent(
+            self.model,
+            tools=[tool(self.submit_decision_evidence_report)],
+            prompt=(
+                "You are completing a missing audit artifact for a financial benchmark. "
+                "You may only submit the decision_evidence_report tool. Do not trade."
+            ),
+        )
+        try:
+            response = await recovery_agent.ainvoke(
+                {"messages": [{"role": "user", "content": recovery_prompt}]},
+                {"recursion_limit": 4},
+            )
+            self._log_full_conversation(
+                log_file,
+                response,
+                decision_time=decision_time,
+                decision_count=decision_count,
+            )
+            recovery_final = extract_llm_conversation(response, "final") or ""
+            submitted_report = self.runtime_context.get("SUBMITTED_DECISION_EVIDENCE_REPORT")
+            report_content = (
+                json.dumps({"decision_evidence_report": submitted_report}, ensure_ascii=False)
+                if isinstance(submitted_report, dict)
+                else (self._latest_decision_report_content_from_conversation(response) or recovery_final or None)
+            )
+            if recovery_final:
+                self._log_message(
+                    log_file,
+                    [{"role": "assistant", "content": f"Report-only recovery response:\n{recovery_final}"}],
+                    decision_time=decision_time,
+                    decision_count=decision_count,
+                )
+            if not report_content:
+                return None
+            report_log_entry = self._log_benchmark_decision_report(
+                log_file,
+                report_content,
+                decision_time=decision_time,
+                decision_count=decision_count,
+            )
+            if report_log_entry.get("parse_success") and report_log_entry.get("schema_valid"):
+                print("✅ Report-only recovery submitted a valid decision_evidence_report")
+                return report_log_entry
+            print(
+                "⚠️ Report-only recovery still invalid: "
+                f"parse_success={report_log_entry.get('parse_success')}, "
+                f"schema_valid={report_log_entry.get('schema_valid')}, "
+                f"missing={report_log_entry.get('missing_required_sections')}"
+            )
+        except Exception as exc:
+            print(f"⚠️ Report-only recovery failed: {exc}")
         return None
 
     def _validate_benchmark_decision_report(self, report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3561,7 +3810,10 @@ class AgenticWorkflow:
                             if isinstance(cited, list):
                                 inferred_risk_checks.extend(cited)
                         candidate["risk_checks_mentioned"] = list(dict.fromkeys(inferred_risk_checks))
-                        warnings.append(f"candidate_review[{idx}].risk_checks_mentioned_inferred_from_actions")
+                        if inferred_risk_checks:
+                            warnings.append(f"candidate_review[{idx}].risk_checks_mentioned_inferred_from_actions")
+                        else:
+                            warnings.append(f"candidate_review[{idx}].risk_checks_mentioned_defaulted_empty")
                     for field in ("symbol", "rank", "selected_for_action", "news_evidence_used", "price_evidence_used", "risk_checks_mentioned"):
                         if field not in candidate:
                             missing.append(f"candidate_review[{idx}].{field}")
@@ -3573,17 +3825,22 @@ class AgenticWorkflow:
                     else:
                         signal_eval = price_evidence.get("signal_evaluation")
                         if not isinstance(signal_eval, dict):
-                            missing.append(f"candidate_review[{idx}].price_evidence_used.signal_evaluation")
-                        else:
-                            for field in (
-                                "momentum_reading",
-                                "trend_reading",
-                                "risk_reading",
-                                "momentum_trend_conflict",
-                                "decision_implication",
-                            ):
-                                if field not in signal_eval:
-                                    missing.append(f"candidate_review[{idx}].price_evidence_used.signal_evaluation.{field}")
+                            signal_eval = {}
+                            price_evidence["signal_evaluation"] = signal_eval
+                            warnings.append(f"candidate_review[{idx}].price_evidence_used.signal_evaluation_defaulted")
+                        signal_defaults = {
+                            "momentum_reading": "unknown",
+                            "trend_reading": "unknown",
+                            "risk_reading": "unknown",
+                            "momentum_trend_conflict": False,
+                            "decision_implication": "unknown",
+                        }
+                        for field, default_value in signal_defaults.items():
+                            if field not in signal_eval:
+                                signal_eval[field] = default_value
+                                warnings.append(
+                                    f"candidate_review[{idx}].price_evidence_used.signal_evaluation.{field}_defaulted"
+                                )
                     news_evidence = candidate.get("news_evidence_used")
                     if not isinstance(news_evidence, list):
                         missing.append(f"candidate_review[{idx}].news_evidence_used")
@@ -4868,6 +5125,7 @@ class AgenticWorkflow:
             f"{self.signature}:{normalize_decision_time(today_date, current_time)}:"
             f"{os.getpid()}:{time.time_ns()}"
         )
+        self.runtime_context["SUBMITTED_DECISION_EVIDENCE_REPORT"] = None
 
         # Set up logging
         log_file = self._setup_logging(today_date, current_time)
@@ -5043,13 +5301,13 @@ class AgenticWorkflow:
             "请严格按照observation_block中的要求执行任务，不要复述输入内容。必须：\n"
             "1. 生成Observation Summary（覆盖所有股票）\n"
             "2. 基于分析进行交易决策；BUY、SELL、HOLD、active waiting/no_trade 同等有效，不要为了活跃而交易。\n"
-            "3. 输出一个合法 fenced JSON block，顶层必须包含 decision_evidence_report，schema_version 必须为 2。该 JSON 必须包含 observed_universe、candidate_review、actions_planned_or_taken、workflow_trace。\n"
+            "3. 完成交易动作后，必须调用 submit_decision_evidence_report 工具提交结构化 decision_evidence_report；兼容起见，最终回答也可以保留同内容的合法 fenced JSON block。schema_version 必须为 2，且必须包含 observed_universe、candidate_review、actions_planned_or_taken、workflow_trace。\n"
             "4. 即使某项没有证据，也必须用 []、\"\"、false 或 null 填入对应 key；不要省略 required key，不要在 JSON block 内写解释文字或尾随逗号。\n"
             "5. candidate_review 的每个候选股票必须是一个完整对象；risk_checks_mentioned、buy_reason_text、reject_or_hold_reason_text 必须在该候选对象内部，不能写在对象闭合之后。\n"
             "6. candidate_review 只记录你当时使用的证据：新闻标题/发布时间/来源/你的解释、价格指标、signal_evaluation、风险检查、买入或拒绝理由。不要输出 Fin-SNR Failure、Top3、hit/miss、news-conflict failure、overheated-positive-news failure、weak-reason loss 等事后结论。\n"
             "7. actions_planned_or_taken 只记录实际计划或已执行动作，以及动作理由和链接的证据标题；如果不交易，也必须写一条 no_trade 动作和 reason_text，并引用至少2个具体数据点作为主动观望依据。\n"
             "8. 若考虑 SELL，必须先使用 Holdings detail 中的 available_to_sell，而不是 total shares；locked_today 不可卖。\n"
-            "9. 最终回答的最后部分必须是且只能是一个 fenced JSON block，然后紧跟结束信号；JSON 后不要再写解释、Markdown 列表或表格。\n"
+            "9. 若最终回答包含 JSON，最后部分必须是且只能是一个 fenced JSON block，然后紧跟结束信号；JSON 后不要再写解释、Markdown 列表或表格。\n"
             "10. 提交前自检：每个 candidate_review 对象都必须包含 symbol、rank、selected_for_action、news_evidence_used、price_evidence_used、risk_checks_mentioned、buy_reason_text、reject_or_hold_reason_text；每个 signal_evaluation 都必须包含 momentum_reading、trend_reading、risk_reading、momentum_trend_conflict、decision_implication。\n"
             f"11. 使用 {STOP_SIGNAL} 结束"
         )
@@ -5110,9 +5368,19 @@ class AgenticWorkflow:
             
             # Extract agentic workflow response
             agent_response = extract_llm_conversation(response, "final")
+            submitted_report = self.runtime_context.get("SUBMITTED_DECISION_EVIDENCE_REPORT")
+            submitted_report_content = (
+                json.dumps({"decision_evidence_report": submitted_report}, ensure_ascii=False)
+                if isinstance(submitted_report, dict)
+                else None
+            )
             if agent_response and agent_response.strip():
                 final_agent_summary = agent_response
-                report_content = self._latest_decision_report_content_from_conversation(response) or agent_response
+                report_content = (
+                    submitted_report_content
+                    or self._latest_decision_report_content_from_conversation(response)
+                    or agent_response
+                )
                 if STOP_SIGNAL in agent_response:
                     print("✅ Received stop signal, trading session ended")
                 else:
@@ -5128,6 +5396,22 @@ class AgenticWorkflow:
                 report_log_entry = self._log_benchmark_decision_report(
                     log_file,
                     report_content,
+                    decision_time=current_time,
+                    decision_count=decision_count,
+                )
+            elif submitted_report_content:
+                print("ℹ️ Agent submitted decision_evidence_report via tool without final response")
+                final_agent_summary = "AUDIT_REPORT_SUBMITTED_VIA_TOOL"
+                collected_tool_errors.append("Missing final response after report tool submission")
+                self._log_message(
+                    log_file,
+                    [{"role": "system", "content": "Agent submitted decision_evidence_report via tool without final response."}],
+                    decision_time=current_time,
+                    decision_count=decision_count,
+                )
+                report_log_entry = self._log_benchmark_decision_report(
+                    log_file,
+                    submitted_report_content,
                     decision_time=current_time,
                     decision_count=decision_count,
                 )
@@ -5164,13 +5448,27 @@ class AgenticWorkflow:
                 not report_log_entry.get("parse_success")
                 or not report_log_entry.get("schema_valid")
             ):
+                recovered_report_log_entry = await self._recover_decision_report_only(
+                    log_file=log_file,
+                    context_message=context_message,
+                    final_agent_summary=final_agent_summary,
+                    tool_summary=tool_summary,
+                    decision_time=current_time,
+                    decision_count=decision_count,
+                )
+                if recovered_report_log_entry:
+                    report_log_entry = recovered_report_log_entry
+                    collected_tool_errors.append("decision_evidence_report recovered by report-only retry")
+                    final_agent_summary = final_agent_summary or "AUDIT_REPORT_RECOVERED_BY_REPORT_ONLY_RETRY"
                 reason = (
                     f"decision_evidence_report invalid: parse_success={report_log_entry.get('parse_success')}, "
                     f"schema_valid={report_log_entry.get('schema_valid')}, "
                     f"parse_error={report_log_entry.get('parse_error')}, "
                     f"missing={report_log_entry.get('missing_required_sections')}"
                 )
-                if get_runtime_config_value("IF_TRADE"):
+                if report_log_entry.get("parse_success") and report_log_entry.get("schema_valid"):
+                    print("✅ decision_evidence_report valid after report-only recovery")
+                elif get_runtime_config_value("IF_TRADE"):
                     # Do not retry after a side-effecting trade tool already ran; that could duplicate orders.
                     print(f"⚠️ {reason}; trade already executed, not retrying this decision point.")
                     collected_tool_errors.append(reason)
